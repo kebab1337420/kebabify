@@ -16,9 +16,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # Serialization
 serde_json = "1"
 
-# Page token is base64-of-base64 (atob(atob(j)) in the lucida client)
-base64 = "0.22"
-
 # Chrome DevTools Protocol (cookie import from a real browser)
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

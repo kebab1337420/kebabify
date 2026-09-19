@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct Cdp {
     ws: Ws,
@@ -42,17 +43,52 @@ impl Cdp {
 use tokio_tungstenite::tungstenite::Message;
 
 fn find_browser() -> Result<PathBuf> {
-    let candidates: Vec<PathBuf> = vec![
-        r"C:\Users\Alaric\AppData\Local\imput\Helium\Application\chrome.exe".into(),
-    ];
-    for c in candidates {
-        if c.exists() {
-            return Ok(c);
+    for var in [
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "LOCALAPPDATA",
+    ] {
+        if let Some(dir) = std::env::var_os(var) {
+            let dir = PathBuf::from(dir);
+            for p in [
+                dir.join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+                dir.join("Microsoft")
+                    .join("Edge")
+                    .join("Application")
+                    .join("msedge.exe"),
+            ] {
+                if p.exists() {
+                    return Ok(p);
+                }
+            }
         }
     }
     which::which("chrome.exe")
+        .or_else(|_| which::which("chrome"))
         .or_else(|_| which::which("msedge.exe"))
+        .or_else(|_| which::which("msedge"))
+        .or_else(|_| which::which("chromium"))
         .context("no Chromium browser found")
+}
+
+fn cookies_file() -> PathBuf {
+    for var in [
+        "KEBABIFY_COOKIES_PATH",
+        "KEBACCIFY_COOKIES_PATH",
+        "KEBACCFIY_COOKIES_PATH",
+    ] {
+        if let Some(p) = std::env::var_os(var) {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var("APPDATA")
+        .ok()
+        .map(|a| PathBuf::from(a).join("Kebabify").join("cookies.txt"))
+        .unwrap_or(PathBuf::from("cookies.txt"))
 }
 
 fn free_port() -> Result<u16> {
@@ -64,7 +100,10 @@ fn launch_browser(browser: &PathBuf, port: u16, url: &str) -> Result<Child> {
     Ok(Command::new(browser)
         .args([
             &format!("--remote-debugging-port={port}"),
-            &format!("--user-data-dir={}", std::env::temp_dir().join("kebabify-cap").display()),
+            &format!(
+                "--user-data-dir={}",
+                std::env::temp_dir().join("kebabify-cap").display()
+            ),
             "--remote-allow-origins=*",
             "--no-first-run",
             "--no-default-browser-check",
@@ -80,13 +119,18 @@ async fn wait_for_page(port: u16) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let client = reqwest::Client::new();
     while Instant::now() < deadline {
-        if let Ok(r) = client.get(format!("http://127.0.0.1:{port}/json")).send().await {
+        if let Ok(r) = client
+            .get(format!("http://127.0.0.1:{port}/json"))
+            .send()
+            .await
+        {
             if let Ok(v) = r.json::<Value>().await {
                 if let Some(pages) = v.as_array() {
                     for p in pages {
                         let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
                         if ty == "page" {
-                            if let Some(ws) = p.get("webSocketDebuggerUrl").and_then(Value::as_str) {
+                            if let Some(ws) = p.get("webSocketDebuggerUrl").and_then(Value::as_str)
+                            {
                                 return Ok(ws.to_string());
                             }
                         }
@@ -124,7 +168,11 @@ async fn capture(cdp: &mut Cdp, secs: u64) -> Result<()> {
                                 if let Some(req) = params.get("request") {
                                     let url = req.get("url").and_then(Value::as_str).unwrap_or("");
                                     if url.contains("lucida") || url.contains("api") {
-                                        println!(">> REQ {} {}", req.get("method").and_then(Value::as_str).unwrap_or(""), url);
+                                        println!(
+                                            ">> REQ {} {}",
+                                            req.get("method").and_then(Value::as_str).unwrap_or(""),
+                                            url
+                                        );
                                         pending.push(v.clone());
                                     }
                                 }
@@ -136,7 +184,10 @@ async fn capture(cdp: &mut Cdp, secs: u64) -> Result<()> {
                                     .and_then(Value::as_str)
                                     .unwrap_or("");
                                 if url.contains("lucida") || url.contains("api") {
-                                    let status = params.pointer("/response/status").and_then(Value::as_u64).unwrap_or(0);
+                                    let status = params
+                                        .pointer("/response/status")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0);
                                     println!("<< RESP {status} {url}");
                                 }
                             }
@@ -171,22 +222,14 @@ async fn main() -> Result<()> {
     let mut cdp = Cdp::connect(&ws_url).await?;
 
     // inject cookies
-    let cookie_line = std::fs::read_to_string(
-        std::env::var("KEBABIFY_COOKIES_PATH")
-            .or_else(|_| std::env::var("KEBACCFIY_COOKIES_PATH"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::var("APPDATA")
-                    .ok()
-                    .map(|a| PathBuf::from(a).join("Kebaccify").join("cookies.txt"))
-                    .unwrap_or(PathBuf::from("cookies.txt"))
-            }),
-    )?;
+    let cookie_line = std::fs::read_to_string(cookies_file())?;
     let lines: Vec<&str> = cookie_line.lines().collect();
     let cookie = lines.last().copied().unwrap_or("").trim();
     for c in cookie.split(';') {
         let c = c.trim();
-        if c.is_empty() { continue; }
+        if c.is_empty() {
+            continue;
+        }
         let mut it = c.splitn(2, '=');
         let name = it.next().unwrap_or("");
         let value = it.next().unwrap_or("");

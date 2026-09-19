@@ -26,16 +26,49 @@ pub fn cookies_file_path() -> PathBuf {
 }
 
 fn cookies_path() -> PathBuf {
-    if let Some(override_path) = std::env::var_os("KEBABIFY_COOKIES_PATH")
-        .or_else(|| std::env::var_os("KEBACCFIY_COOKIES_PATH")) {
-        return PathBuf::from(override_path);
+    if let Some(p) = cookies_override() {
+        return p;
     }
+    default_cookies_path()
+}
+
+/// Explicit file override, when set. Accepts the current name plus the
+/// historical spellings so existing setups keep working.
+fn cookies_override() -> Option<PathBuf> {
+    // NOTE: "KEBACCFIY_COOKIES_PATH" is a historical typo (F/I swapped) that
+    // shipped in early versions — keep reading it for compat, but prefer the
+    // correctly-spelled variables.
+    for var in [
+        "KEBABIFY_COOKIES_PATH",
+        "KEBACCIFY_COOKIES_PATH",
+        "KEBACCFIY_COOKIES_PATH",
+    ] {
+        if let Some(p) = std::env::var_os(var) {
+            return Some(PathBuf::from(p));
+        }
+    }
+    None
+}
+
+fn default_cookies_path() -> PathBuf {
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        PathBuf::from(appdata).join("Kebaccify").join("cookies.txt")
+        PathBuf::from(appdata).join("Kebabify").join("cookies.txt")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".kebaccify").join("cookies.txt")
+        PathBuf::from(home).join(".kebabify").join("cookies.txt")
     } else {
-        PathBuf::from("kebaccify_cookies.txt")
+        PathBuf::from("kebabify_cookies.txt")
+    }
+}
+
+/// Previous install location (pre-rename "Kebaccify"). Only used as a
+/// read-fallback so existing users don't lose their stored session.
+fn legacy_cookies_path() -> Option<PathBuf> {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        Some(PathBuf::from(appdata).join("Kebaccify").join("cookies.txt"))
+    } else if let Some(home) = std::env::var_os("HOME") {
+        Some(PathBuf::from(home).join(".kebaccify").join("cookies.txt"))
+    } else {
+        Some(PathBuf::from("kebaccify_cookies.txt"))
     }
 }
 
@@ -47,7 +80,24 @@ pub struct CloudflareSession {
 }
 
 fn load_session() -> Option<CloudflareSession> {
-    let text = std::fs::read_to_string(cookies_path()).ok()?;
+    // An explicit override pins the exact file (no legacy fallback), so tests
+    // and portable setups stay isolated from any machine-wide session.
+    if let Some(pinned) = cookies_override() {
+        return read_session(&pinned);
+    }
+    if let Some(s) = read_session(&cookies_path()) {
+        return Some(s);
+    }
+    if let Some(legacy) = legacy_cookies_path() {
+        if legacy != cookies_path() {
+            return read_session(&legacy);
+        }
+    }
+    None
+}
+
+fn read_session(path: &std::path::Path) -> Option<CloudflareSession> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let user_agent = lines.next()?.trim().to_string();
     let cookie = lines.next()?.trim().to_string();
@@ -75,10 +125,11 @@ pub fn save_cookies(user_agent: &str, cookie_header: &str) -> Result<()> {
 
 /// Applies the shared identity (captured UA + cookies, or the stock UA) to a
 /// lucida request.
-fn identify(req: reqwest::RequestBuilder, session: Option<&CloudflareSession>) -> reqwest::RequestBuilder {
-    let ua = session
-        .map(|s| s.user_agent.as_str())
-        .unwrap_or(USER_AGENT);
+fn identify(
+    req: reqwest::RequestBuilder,
+    session: Option<&CloudflareSession>,
+) -> reqwest::RequestBuilder {
+    let ua = session.map(|s| s.user_agent.as_str()).unwrap_or(USER_AGENT);
     let req = req.header("User-Agent", ua);
     match session {
         Some(s) => req.header("Cookie", &s.cookie),
@@ -190,10 +241,16 @@ pub async fn open_stream(
 
     let mut ready = false;
     for _ in 0..MAX_POLLS {
-        match identify(client.get(&status_url), session.as_ref()).send().await {
+        match identify(client.get(&status_url), session.as_ref())
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(status_json) = resp.json::<serde_json::Value>().await {
-                    let status = status_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = status_json
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if status == "ready" || status == "done" {
                         ready = true;
                         break;
@@ -238,15 +295,24 @@ const USER_AGENT: &str =
 /// Extracts the CSRF token from the lucida HTML page.
 ///
 /// The page embeds its data in a script block with `"token":"value"` patterns.
+/// Whitespace around the colon is tolerated (`"token" : "value"`), since
+/// minifiers/pretty-printers vary.
 fn extract_csrf_token(html: &str) -> Option<String> {
-    for keyword in &["\"token\":", "\"csrf\":" ] {
-        if let Some(idx) = html.find(keyword) {
-            let after = &html[idx + keyword.len()..];
-            let after = after.trim_start();
+    for key in &["\"token\"", "\"csrf\""] {
+        let mut search_from = 0;
+        while let Some(rel) = html[search_from..].find(key) {
+            let mut after = &html[search_from + rel + key.len()..];
+            after = after.trim_start();
+            if !after.starts_with(':') {
+                search_from += rel + key.len();
+                continue;
+            }
+            after = after[1..].trim_start();
             if let Some(inner) = after.strip_prefix('"') {
                 let end = inner.find('"')?;
                 return Some(inner[..end].to_string());
             }
+            search_from += rel + key.len();
         }
     }
     None
@@ -254,10 +320,20 @@ fn extract_csrf_token(html: &str) -> Option<String> {
 
 /// Extracts the token expiry timestamp from the lucida HTML page.
 fn extract_token_expiry(html: &str) -> Option<u64> {
-    if let Some(idx) = html.find("\"token_expiry\":") {
-        let after = &html[idx + 15..];
-        let after = after.trim_start();
+    let key = "\"token_expiry\"";
+    let mut search_from = 0;
+    while let Some(rel) = html[search_from..].find(key) {
+        let mut after = html[search_from + rel + key.len()..].trim_start();
+        if !after.starts_with(':') {
+            search_from += rel + key.len();
+            continue;
+        }
+        after = after[1..].trim_start();
         let end = after.find(|c: char| !c.is_ascii_digit())?;
+        if end == 0 {
+            search_from += rel + key.len();
+            continue;
+        }
         return after[..end].parse::<u64>().ok();
     }
     None
@@ -299,6 +375,12 @@ mod tests {
     }
 
     #[test]
+    fn csrf_token_tolerates_whitespace() {
+        let html = r#"<script>const x = { "token" : "spaced123" };</script>"#;
+        assert_eq!(extract_csrf_token(html).as_deref(), Some("spaced123"));
+    }
+
+    #[test]
     fn csrf_token_missing() {
         assert_eq!(extract_csrf_token("<html></html>"), None);
     }
@@ -306,6 +388,12 @@ mod tests {
     #[test]
     fn token_expiry_extracted() {
         let html = r#"{"token_expiry":1780000000000,"ok":true}"#;
+        assert_eq!(extract_token_expiry(html), Some(1_780_000_000_000));
+    }
+
+    #[test]
+    fn token_expiry_tolerates_whitespace() {
+        let html = r#"{ "token_expiry" : 1780000000000 }"#;
         assert_eq!(extract_token_expiry(html), Some(1_780_000_000_000));
     }
 
@@ -325,7 +413,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kebabify_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cookies.txt");
-        std::env::set_var("KEBACCFIY_COOKIES_PATH", &path);
+        std::env::set_var("KEBABIFY_COOKIES_PATH", &path);
 
         assert!(load_session().is_none());
 
@@ -339,7 +427,7 @@ mod tests {
         assert_eq!(s.cookie, "cf_clearance=abc; __cf_bm=def");
 
         std::fs::remove_file(&path).unwrap();
-        std::env::remove_var("KEBACCFIY_COOKIES_PATH");
+        std::env::remove_var("KEBABIFY_COOKIES_PATH");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -47,14 +47,19 @@ impl SpotifyPatcher {
         let backup_user_css = backup_dir.join("user.css");
         let user_css_path = self.xpui_dir.join("user.css");
         if backup_user_css.exists() {
-            std::fs::copy(&backup_user_css, &user_css_path)
-                .with_context(|| format!("Failed to restore user.css from {}", backup_user_css.display()))?;
+            std::fs::copy(&backup_user_css, &user_css_path).with_context(|| {
+                format!(
+                    "Failed to restore user.css from {}",
+                    backup_user_css.display()
+                )
+            })?;
         } else if user_css_path.exists() {
             // No pristine copy to restore (user.css didn't exist at first
             // apply) — strip the injected block instead of leaving the theme
             // behind after "restore".
-            let mut content = std::fs::read_to_string(&user_css_path)
-                .with_context(|| format!("Failed to read user.css at {}", user_css_path.display()))?;
+            let mut content = std::fs::read_to_string(&user_css_path).with_context(|| {
+                format!("Failed to read user.css at {}", user_css_path.display())
+            })?;
             strip_theme_blocks(&mut content);
             std::fs::write(&user_css_path, &content)
                 .context("Failed to write restored user.css")?;
@@ -63,8 +68,12 @@ impl SpotifyPatcher {
         let backup_index = backup_dir.join("index.html");
         let index_path = self.xpui_dir.join("index.html");
         if backup_index.exists() {
-            std::fs::copy(&backup_index, &index_path)
-                .with_context(|| format!("Failed to restore index.html from {}", backup_index.display()))?;
+            std::fs::copy(&backup_index, &index_path).with_context(|| {
+                format!(
+                    "Failed to restore index.html from {}",
+                    backup_index.display()
+                )
+            })?;
         }
 
         // Remove extension files
@@ -134,7 +143,10 @@ impl SpotifyPatcher {
         println!("Backup exists:         {}", backup_exists);
         println!("Theme injected:        {}", css_injected);
         println!("Extensions injected:   {}", js_exists && index_has_kebab);
-        println!("Status: {}", if is_patched { "Patched" } else { "Not patched" });
+        println!(
+            "Status: {}",
+            if is_patched { "Patched" } else { "Not patched" }
+        );
 
         Ok(())
     }
@@ -155,10 +167,7 @@ impl SpotifyPatcher {
         // Only files that `apply_patches` actually modifies. Because backup
         // files are never overwritten once created, the first run always
         // captures the true originals — re-applying keeps the pristine copy.
-        let files_to_backup = vec![
-            "user.css",
-            "index.html",
-        ];
+        let files_to_backup = vec!["user.css", "index.html"];
 
         let mut backed_up = 0;
         for file_name in &files_to_backup {
@@ -195,13 +204,9 @@ impl SpotifyPatcher {
         if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');
         }
-        content.push_str(&format!(
-            "{}\n{}\n{}\n",
-            marker, css, end_marker
-        ));
+        content.push_str(&format!("{}\n{}\n{}\n", marker, css, end_marker));
 
-        std::fs::write(&css_path, &content)
-            .context("Failed to inject CSS theme")?;
+        std::fs::write(&css_path, &content).context("Failed to inject CSS theme")?;
 
         eprintln!("  Injected: user.css (theme applied)");
         Ok(())
@@ -235,8 +240,7 @@ impl SpotifyPatcher {
             content.push_str(&inline_script);
         }
 
-        std::fs::write(&index_path, &content)
-            .context("Failed to write patched index.html")?;
+        std::fs::write(&index_path, &content).context("Failed to write patched index.html")?;
 
         eprintln!("  Injected: index.html (JS extension loaded)");
         eprintln!("  Written: ext/kebabify_ext.js");
@@ -259,15 +263,26 @@ impl SpotifyPatcher {
 
         // Register in config-xpui.ini under [AdditionalOptions] extensions.
         let config_path = extensions_dir.parent().unwrap().join("config-xpui.ini");
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read Spicetify config at {}", config_path.display()))?;
+        let content = std::fs::read_to_string(&config_path).with_context(|| {
+            format!(
+                "Failed to read Spicetify config at {}",
+                config_path.display()
+            )
+        })?;
         let updated = set_config_extensions(&content, "kebabify_ext.js", true);
         if updated != content {
-            std::fs::write(&config_path, &updated)
-                .with_context(|| format!("Failed to write Spicetify config at {}", config_path.display()))?;
+            std::fs::write(&config_path, &updated).with_context(|| {
+                format!(
+                    "Failed to write Spicetify config at {}",
+                    config_path.display()
+                )
+            })?;
         }
 
-        eprintln!("  Synced: Spicetify extension registered ({})", dst.display());
+        eprintln!(
+            "  Synced: Spicetify extension registered ({})",
+            dst.display()
+        );
         Ok(Some(extensions_dir))
     }
 
@@ -311,7 +326,10 @@ mod tests {
         for name in ["kebaccify", "kebabify"] {
             for quote in ["'", "\""] {
                 for defer in ["", "defer "] {
-                    content.push_str(&format!("<script {}src={}ext/{}_ext.js{}></script>", defer, quote, name, quote));
+                    content.push_str(&format!(
+                        "<script {}src={}ext/{}_ext.js{}></script>",
+                        defer, quote, name, quote
+                    ));
                 }
             }
             content.push_str(&format!("<script>\n// {}_ext.js\nrun()</script>", name));
@@ -359,14 +377,17 @@ mod tests {
 
     #[test]
     fn strips_spicetify_extensions_script_tag() {
-        let mut content = String::from("<body><script defer src='extensions/kebabify_ext.js'></script>keep()</body>");
+        let mut content = String::from(
+            "<body><script defer src='extensions/kebabify_ext.js'></script>keep()</body>",
+        );
         strip_extension_scripts(&mut content);
         assert_eq!(content, "<body>keep()</body>");
     }
 
     #[test]
     fn legacy_backups_take_precedence_without_modification() {
-        let root = std::env::temp_dir().join(format!("kebabify_backup_test_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("kebabify_backup_test_{}", std::process::id()));
         let patcher = SpotifyPatcher {
             spotify_dir: root.clone(),
             xpui_dir: root.join("Apps").join("xpui"),
@@ -397,7 +418,10 @@ fn strip_extension_scripts(content: &mut String) {
         for dir in ["ext/", "extensions/"] {
             for quote in ["'", "\""] {
                 for defer in ["", "defer "] {
-                    let tag = format!("<script {}src={}{}{}_ext.js{}></script>", defer, quote, dir, name, quote);
+                    let tag = format!(
+                        "<script {}src={}{}{}_ext.js{}></script>",
+                        defer, quote, dir, name, quote
+                    );
                     *content = content.replace(&tag, "");
                 }
             }
@@ -420,7 +444,9 @@ fn strip_extension_scripts(content: &mut String) {
 fn spicetify_extensions_dir() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     let dir = PathBuf::from(appdata).join("spicetify");
-    dir.join("Extensions").exists().then(|| dir.join("Extensions"))
+    dir.join("Extensions")
+        .exists()
+        .then(|| dir.join("Extensions"))
 }
 
 /// Insert (or remove) `name` in the `extensions` list under
@@ -495,7 +521,7 @@ fn find_spotify_install() -> Result<PathBuf> {
         // Modern Spotify installs to APPDATA\Roaming\Spotify
         if let Ok(appdata) = std::env::var("APPDATA") {
             let path = PathBuf::from(appdata).join("Spotify");
-            if path.exists() && path.join("Apps\\xpui").exists() {
+            if path.exists() && path.join("Apps").join("xpui").exists() {
                 return Ok(path);
             }
         }
@@ -503,27 +529,29 @@ fn find_spotify_install() -> Result<PathBuf> {
         // Fallback: LOCALAPPDATA
         if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
             let path = PathBuf::from(localappdata).join("Spotify");
-            if path.exists() && path.join("Apps\\xpui").exists() {
+            if path.exists() && path.join("Apps").join("xpui").exists() {
                 return Ok(path);
             }
         }
 
         // Fallback: WindowsApps
         let winapps = PathBuf::from("C:\\Program Files\\WindowsApps\\SpotifyAB.Spotify");
-        if winapps.exists() && winapps.join("Apps\\xpui").exists() {
+        if winapps.exists() && winapps.join("Apps").join("xpui").exists() {
             return Ok(winapps);
         }
 
         if let Ok(exe) = which::which("spotify") {
             if let Some(parent) = exe.parent() {
                 let spotify_path = parent.to_path_buf();
-                if spotify_path.join("Apps\\xpui").exists() {
+                if spotify_path.join("Apps").join("xpui").exists() {
                     return Ok(spotify_path);
                 }
             }
         }
 
-        Err(anyhow!("Spotify installation not found. Please install Spotify first."))
+        Err(anyhow!(
+            "Spotify installation not found. Please install Spotify first."
+        ))
     }
 
     #[cfg(target_os = "macos")]

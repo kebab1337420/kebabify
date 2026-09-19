@@ -22,7 +22,8 @@ const CHROME_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(600);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Small CDP client over one WebSocket.
 struct Cdp {
@@ -32,7 +33,9 @@ struct Cdp {
 
 impl Cdp {
     async fn connect(url: &str) -> Result<Self> {
-        let (ws, _) = connect_async(url).await.context("Cannot connect to Chrome DevTools")?;
+        let (ws, _) = connect_async(url)
+            .await
+            .context("Cannot connect to Chrome DevTools")?;
         Ok(Self { ws, next_id: 1 })
     }
 
@@ -137,7 +140,11 @@ async fn collect(cdp: &mut Cdp) -> Result<(String, String)> {
 }
 
 fn response_cookies(resp: &Value) -> Result<Vec<(String, String)>> {
-    let Some(list) = resp.get("result").and_then(|r| r.get("cookies")).and_then(Value::as_array) else {
+    let Some(list) = resp
+        .get("result")
+        .and_then(|r| r.get("cookies"))
+        .and_then(Value::as_array)
+    else {
         return Err(anyhow!("Unexpected CDP getCookies response: {}", resp));
     };
     let mut out = Vec::new();
@@ -175,7 +182,12 @@ async fn wait_for_page(port: u16) -> Option<String> {
     let list_url = format!("http://127.0.0.1:{}/json", port);
     let deadline = std::time::Instant::now() + CHROME_START_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&list_url).timeout(Duration::from_secs(2)).send().await {
+        if let Ok(resp) = client
+            .get(&list_url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
             if let Ok(targets) = resp.json::<Value>().await {
                 if let Some(list) = targets.as_array() {
                     for t in list {
@@ -183,7 +195,8 @@ async fn wait_for_page(port: u16) -> Option<String> {
                         let url = t.get("url").and_then(Value::as_str).unwrap_or("");
                         let is_lucida = url.contains("lucida.to") || url.is_empty();
                         if is_page && is_lucida {
-                            if let Some(ws) = t.get("webSocketDebuggerUrl").and_then(Value::as_str) {
+                            if let Some(ws) = t.get("webSocketDebuggerUrl").and_then(Value::as_str)
+                            {
                                 return Some(ws.to_string());
                             }
                         }
@@ -198,12 +211,26 @@ async fn wait_for_page(port: u16) -> Option<String> {
 
 fn find_browser() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    for var in ["PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "LOCALAPPDATA"] {
+    for var in [
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "LOCALAPPDATA",
+    ] {
         if let Some(dir) = std::env::var_os(var) {
             let dir = PathBuf::from(dir);
-            candidates.push(dir.join("Google").join("Chrome").join("Application").join("chrome.exe"));
-            candidates.push(dir.join("Microsoft").join("Edge").join("Application").join("msedge.exe"));
-            candidates.push(dir.join("Google").join("Chrome").join("Application").join("msedge.exe"));
+            candidates.push(
+                dir.join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+            );
+            candidates.push(
+                dir.join("Microsoft")
+                    .join("Edge")
+                    .join("Application")
+                    .join("msedge.exe"),
+            );
         }
     }
     candidates
@@ -218,7 +245,7 @@ fn find_browser() -> Option<PathBuf> {
 /// browsers register when installed (covers Chromium forks like Helium).
 #[cfg(target_os = "windows")]
 fn find_browser_registry() -> Option<PathBuf> {
-    use winreg::enums::{KEY_READ, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
 
     const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths";
 

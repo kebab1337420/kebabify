@@ -19,9 +19,9 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::process::Stdio;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::process::Stdio;
 
 mod audio_proxy;
 mod browser_import;
@@ -114,21 +114,19 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Status) => {
-            match patcher {
-                Ok(p) => {
-                    p.print_status()?;
-                    if audio_proxy::AudioProxy::is_running().await {
-                        println!("Audio proxy:           running");
-                    } else {
-                        println!("Audio proxy:           stopped");
-                    }
-                }
-                Err(e) => {
-                    println!("Spotify not found: {}", e);
+        Some(Commands::Status) => match patcher {
+            Ok(p) => {
+                p.print_status()?;
+                if audio_proxy::AudioProxy::is_running().await {
+                    println!("Audio proxy:           running");
+                } else {
+                    println!("Audio proxy:           stopped");
                 }
             }
-        }
+            Err(e) => {
+                println!("Spotify not found: {}", e);
+            }
+        },
         Some(Commands::Cookie { user_agent, cookie }) => {
             lucida::save_cookies(&user_agent, &cookie)?;
             println!("kebabify — Cloudflare cookies stored.");
@@ -180,7 +178,8 @@ async fn main() -> Result<()> {
                         // This is critical — if we use tokio::spawn, the proxy dies
                         // when main() returns. Instead we launch a separate kebabify.exe
                         // process with the --audio-proxy-only flag that lives independently.
-                        let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
+                        let exe =
+                            std::env::current_exe().context("Cannot find kebabify.exe path")?;
                         let mut cmd = std::process::Command::new(&exe);
                         cmd.arg("audio-proxy-only")
                             .stdout(Stdio::null())
@@ -224,7 +223,10 @@ async fn main() -> Result<()> {
                     match open::that("spotify:") {
                         Ok(_) => println!("Spotify launched."),
                         Err(e) => {
-                            println!("Failed to launch Spotify: {}. Please launch it manually.", e);
+                            println!(
+                                "Failed to launch Spotify: {}. Please launch it manually.",
+                                e
+                            );
                         }
                     }
                 }
