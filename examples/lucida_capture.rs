@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+use tokio_tungstenite::tungstenite::Message;
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -39,8 +40,6 @@ impl Cdp {
         }
     }
 }
-
-use tokio_tungstenite::tungstenite::Message;
 
 fn find_browser() -> Result<PathBuf> {
     for var in [
@@ -147,15 +146,8 @@ async fn capture(cdp: &mut Cdp, secs: u64) -> Result<()> {
     cdp.call("Network.enable", json!({})).await?;
     cdp.call("Page.enable", json!({})).await?;
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut pending: Vec<Value> = Vec::new();
     while Instant::now() < deadline {
-        let id = cdp.next_id;
-        cdp.next_id += 1;
-        cdp.ws
-            .send(Message::Text(
-                json!({"id": id, "method": "Network.enable", "params": {}}).to_string(),
-            ))
-            .await?;
+        // Network/Page domains are already enabled above — just drain events.
         // read events for 500ms
         let ev_deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < ev_deadline {
@@ -173,7 +165,6 @@ async fn capture(cdp: &mut Cdp, secs: u64) -> Result<()> {
                                             req.get("method").and_then(Value::as_str).unwrap_or(""),
                                             url
                                         );
-                                        pending.push(v.clone());
                                     }
                                 }
                             }

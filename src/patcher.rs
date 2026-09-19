@@ -9,7 +9,7 @@
 //! previously NOP'd bytes and could produce invalid JavaScript.
 
 use anyhow::{anyhow, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The patcher instance — holds paths for the Spotify install and user data.
 pub struct SpotifyPatcher {
@@ -262,7 +262,7 @@ impl SpotifyPatcher {
             .with_context(|| format!("Failed to write Spicetify extension at {}", dst.display()))?;
 
         // Register in config-xpui.ini under [AdditionalOptions] extensions.
-        let config_path = extensions_dir.parent().unwrap().join("config-xpui.ini");
+        let config_path = spicetify_config_path(&extensions_dir)?;
         let content = std::fs::read_to_string(&config_path).with_context(|| {
             format!(
                 "Failed to read Spicetify config at {}",
@@ -293,7 +293,7 @@ impl SpotifyPatcher {
         };
         let _ = std::fs::remove_file(extensions_dir.join("kebabify_ext.js"));
 
-        let config_path = extensions_dir.parent().unwrap().join("config-xpui.ini");
+        let config_path = spicetify_config_path(&extensions_dir)?;
         if config_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 let updated = set_config_extensions(&content, "kebabify_ext.js", false);
@@ -304,99 +304,6 @@ impl SpotifyPatcher {
         }
         eprintln!("  Removed: Spicetify ext registration");
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strips_both_theme_names_without_removing_user_css() {
-        let mut content = String::from("body {}\n/* kebaccify_start */old/* kebaccify_end *//* kebabify_start */new/* kebabify_end */p {}");
-        strip_theme_blocks(&mut content);
-        assert_eq!(content, "body {}\np {}");
-        strip_theme_blocks(&mut content);
-        assert_eq!(content, "body {}\np {}");
-    }
-
-    #[test]
-    fn strips_both_extension_names_and_preserves_other_scripts() {
-        let mut content = String::from("<body><script>keep()</script>");
-        for name in ["kebaccify", "kebabify"] {
-            for quote in ["'", "\""] {
-                for defer in ["", "defer "] {
-                    content.push_str(&format!(
-                        "<script {}src={}ext/{}_ext.js{}></script>",
-                        defer, quote, name, quote
-                    ));
-                }
-            }
-            content.push_str(&format!("<script>\n// {}_ext.js\nrun()</script>", name));
-        }
-        content.push_str("</body>");
-        strip_extension_scripts(&mut content);
-        assert_eq!(content, "<body><script>keep()</script></body>");
-        strip_extension_scripts(&mut content);
-        assert_eq!(content, "<body><script>keep()</script></body>");
-    }
-
-    #[test]
-    fn adds_extension_to_existing_config_ini() {
-        let ini = "[AdditionalOptions]\nextensions            = spicetify-jam.js\n";
-        let out = set_config_extensions(ini, "kebabify_ext.js", true);
-        assert!(out.contains("kebabify_ext.js"));
-        assert!(out.contains("spicetify-jam.js"));
-    }
-
-    #[test]
-    fn adding_extension_to_config_is_idempotent() {
-        let ini = "[AdditionalOptions]\nextensions            = spicetify-jam.js\n";
-        let once = set_config_extensions(ini, "kebabify_ext.js", true);
-        let twice = set_config_extensions(&once, "kebabify_ext.js", true);
-        assert_eq!(once, twice);
-        assert_eq!(once.matches("kebabify_ext.js").count(), 1);
-    }
-
-    #[test]
-    fn remove_disables_extension_but_keeps_others() {
-        let ini = "[AdditionalOptions]\nextensions            = spicetify-jam.js|kebabify_ext.js\n";
-        let out = set_config_extensions(ini, "kebabify_ext.js", false);
-        assert!(!out.contains("kebabify_ext.js"));
-        assert!(out.contains("spicetify-jam.js"));
-    }
-
-    #[test]
-    fn adds_extensions_line_when_missing_in_section() {
-        let ini = "[AdditionalOptions]\nsidebar_config        = 1\n";
-        let out = set_config_extensions(ini, "kebabify_ext.js", true);
-        assert!(out.contains("extensions"));
-        assert!(out.contains("kebabify_ext.js"));
-        assert!(out.contains("sidebar_config"));
-    }
-
-    #[test]
-    fn strips_spicetify_extensions_script_tag() {
-        let mut content = String::from(
-            "<body><script defer src='extensions/kebabify_ext.js'></script>keep()</body>",
-        );
-        strip_extension_scripts(&mut content);
-        assert_eq!(content, "<body>keep()</body>");
-    }
-
-    #[test]
-    fn legacy_backups_take_precedence_without_modification() {
-        let root =
-            std::env::temp_dir().join(format!("kebabify_backup_test_{}", std::process::id()));
-        let patcher = SpotifyPatcher {
-            spotify_dir: root.clone(),
-            xpui_dir: root.join("Apps").join("xpui"),
-        };
-        assert_eq!(patcher.get_backup_dir(), root.join(".kebabify_backups"));
-        std::fs::create_dir_all(root.join(".kebabify_backups")).unwrap();
-        std::fs::create_dir_all(root.join(".kebaccify_backups")).unwrap();
-        assert_eq!(patcher.get_backup_dir(), root.join(".kebaccify_backups"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -447,6 +354,14 @@ fn spicetify_extensions_dir() -> Option<PathBuf> {
     dir.join("Extensions")
         .exists()
         .then(|| dir.join("Extensions"))
+}
+
+/// `config-xpui.ini` living next to the Spicetify `Extensions` dir.
+fn spicetify_config_path(extensions_dir: &Path) -> Result<PathBuf> {
+    extensions_dir
+        .parent()
+        .map(|p| p.join("config-xpui.ini"))
+        .context("Spicetify Extensions dir has no parent dir")
 }
 
 /// Insert (or remove) `name` in the `extensions` list under
@@ -579,5 +494,108 @@ fn find_spotify_install() -> Result<PathBuf> {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Err(anyhow!("Unsupported platform"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_both_theme_names_without_removing_user_css() {
+        let mut content = String::from("body {}\n/* kebaccify_start */old/* kebaccify_end *//* kebabify_start */new/* kebabify_end */p {}");
+        strip_theme_blocks(&mut content);
+        assert_eq!(content, "body {}\np {}");
+        strip_theme_blocks(&mut content);
+        assert_eq!(content, "body {}\np {}");
+    }
+
+    #[test]
+    fn strips_both_extension_names_and_preserves_other_scripts() {
+        let mut content = String::from("<body><script>keep()</script>");
+        for name in ["kebaccify", "kebabify"] {
+            for quote in ["'", "\""] {
+                for defer in ["", "defer "] {
+                    content.push_str(&format!(
+                        "<script {}src={}ext/{}_ext.js{}></script>",
+                        defer, quote, name, quote
+                    ));
+                }
+            }
+            content.push_str(&format!("<script>\n// {}_ext.js\nrun()</script>", name));
+        }
+        content.push_str("</body>");
+        strip_extension_scripts(&mut content);
+        assert_eq!(content, "<body><script>keep()</script></body>");
+        strip_extension_scripts(&mut content);
+        assert_eq!(content, "<body><script>keep()</script></body>");
+    }
+
+    #[test]
+    fn adds_extension_to_existing_config_ini() {
+        let ini = "[AdditionalOptions]\nextensions            = spicetify-jam.js\n";
+        let out = set_config_extensions(ini, "kebabify_ext.js", true);
+        assert!(out.contains("kebabify_ext.js"));
+        assert!(out.contains("spicetify-jam.js"));
+    }
+
+    #[test]
+    fn adding_extension_to_config_is_idempotent() {
+        let ini = "[AdditionalOptions]\nextensions            = spicetify-jam.js\n";
+        let once = set_config_extensions(ini, "kebabify_ext.js", true);
+        let twice = set_config_extensions(&once, "kebabify_ext.js", true);
+        assert_eq!(once, twice);
+        assert_eq!(once.matches("kebabify_ext.js").count(), 1);
+    }
+
+    #[test]
+    fn remove_disables_extension_but_keeps_others() {
+        let ini = "[AdditionalOptions]\nextensions            = spicetify-jam.js|kebabify_ext.js\n";
+        let out = set_config_extensions(ini, "kebabify_ext.js", false);
+        assert!(!out.contains("kebabify_ext.js"));
+        assert!(out.contains("spicetify-jam.js"));
+    }
+
+    #[test]
+    fn adds_extensions_line_when_missing_in_section() {
+        let ini = "[AdditionalOptions]\nsidebar_config        = 1\n";
+        let out = set_config_extensions(ini, "kebabify_ext.js", true);
+        assert!(out.contains("extensions"));
+        assert!(out.contains("kebabify_ext.js"));
+        assert!(out.contains("sidebar_config"));
+    }
+
+    #[test]
+    fn strips_spicetify_extensions_script_tag() {
+        let mut content = String::from(
+            "<body><script defer src='extensions/kebabify_ext.js'></script>keep()</body>",
+        );
+        strip_extension_scripts(&mut content);
+        assert_eq!(content, "<body>keep()</body>");
+    }
+
+    #[test]
+    fn legacy_backups_take_precedence_without_modification() {
+        let root =
+            std::env::temp_dir().join(format!("kebabify_backup_test_{}", std::process::id()));
+        let patcher = SpotifyPatcher {
+            spotify_dir: root.clone(),
+            xpui_dir: root.join("Apps").join("xpui"),
+        };
+        assert_eq!(patcher.get_backup_dir(), root.join(".kebabify_backups"));
+        std::fs::create_dir_all(root.join(".kebabify_backups")).unwrap();
+        std::fs::create_dir_all(root.join(".kebaccify_backups")).unwrap();
+        assert_eq!(patcher.get_backup_dir(), root.join(".kebaccify_backups"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spicetify_config_path_sits_next_to_extensions() {
+        let ext = PathBuf::from("C:\\Users\\u\\AppData\\Roaming\\spicetify\\Extensions");
+        let cfg = spicetify_config_path(&ext).unwrap();
+        assert_eq!(
+            cfg,
+            PathBuf::from("C:\\Users\\u\\AppData\\Roaming\\spicetify\\config-xpui.ini")
+        );
     }
 }
