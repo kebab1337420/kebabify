@@ -21,6 +21,9 @@ use crate::lucida;
 const CHROME_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(600);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long to wait for a single CDP round-trip before giving up, so a
+/// frozen renderer can't hang `import-cookies` past the challenge deadline.
+const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -48,7 +51,10 @@ impl Cdp {
             .await
             .context("CDP send failed")?;
         loop {
-            match self.ws.next().await {
+            let next = tokio::time::timeout(CDP_CALL_TIMEOUT, self.ws.next())
+                .await
+                .context("Timed out waiting for Chrome DevTools response")?;
+            match next {
                 Some(Ok(Message::Text(text))) => {
                     let msg: Value = serde_json::from_str(&text).context("Bad CDP response")?;
                     if msg.get("id").and_then(Value::as_u64) == Some(id) {
@@ -299,7 +305,9 @@ fn launch_browser(browser: &Path, port: u16, profile: &Path) -> std::io::Result<
     Command::new(browser)
         .arg(format!("--remote-debugging-port={}", port))
         .arg(format!("--user-data-dir={}", profile.display()))
-        .arg("--remote-allow-origins=*")
+        // Least privilege: only our own loopback origin may talk to this
+        // debugging endpoint — never `*`, which would let any local page in.
+        .arg(format!("--remote-allow-origins=http://127.0.0.1:{}", port))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-session-crashed-bubble")

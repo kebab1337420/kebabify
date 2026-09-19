@@ -12,11 +12,6 @@
 //!   kebabify.exe cookie "<user-agent>" "<cf_clearance=…>"  # Unlock lucida.to
 //!   kebabify.exe import-cookies  # Open Chrome, solve challenge, auto-store
 
-#![cfg_attr(
-    all(target_os = "windows", not(debug_assertions)),
-    windows_subsystem = "windows"
-)]
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "windows")]

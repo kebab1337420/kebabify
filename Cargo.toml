@@ -5,6 +5,8 @@ edition = "2021"
 authors = ["Alaric <alaric@kebaccify.dev>"]
 description = "Spicetify-like extension for Spotify: ad-free, lossless audio via lucida.to API"
 license = "MIT"
+repository = "https://github.com/kebab1337420/kebabify"
+readme = "README.md"
 
 [dependencies]
 # Async runtime

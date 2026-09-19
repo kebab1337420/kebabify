@@ -146,6 +146,17 @@ const MAX_POLLS: u32 = 30;
 /// Interval between status polls.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Timeout for the single-shot lucida calls (resolve page, API post).
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Timeout for each status poll.
+const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// NOTE: the final download is intentionally *not* given a total timeout: it
+// streams the whole FLAC body, so bounding the full request would cut
+// long/slow tracks mid-flight (same reason as the shared client in
+// `audio_proxy`, which only sets a connect timeout).
+
 /// A resolved, ready-to-download FLAC stream from lucida.to.
 pub struct LucidaStream {
     /// The HTTP response for the audio download, ready to be streamed.
@@ -173,6 +184,7 @@ pub async fn open_stream(
     // Step 1: resolve the track page to obtain the CSRF token.
     let resolve_url = format!("{}/{}", LUCIDA_BASE, urlencoding::encode(spotify_url));
     let resolve_resp = identify(client.get(&resolve_url), session.as_ref())
+        .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|e| anyhow!("Failed to request lucida.to: {}", e))?;
@@ -212,6 +224,7 @@ pub async fn open_stream(
     });
 
     let dl_resp = identify(client.post(LUCIDA_API_LOAD), session.as_ref())
+        .timeout(REQUEST_TIMEOUT)
         .json(&download_req)
         .send()
         .await
@@ -242,6 +255,7 @@ pub async fn open_stream(
     let mut ready = false;
     for _ in 0..MAX_POLLS {
         match identify(client.get(&status_url), session.as_ref())
+            .timeout(STATUS_TIMEOUT)
             .send()
             .await
         {

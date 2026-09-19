@@ -6,3 +6,6 @@ cookies.txt
 # Spotless: patch backups created next to the repo during tests
 .kebabify_backups/
 .kebaccify_backups/
+# Editors
+.idea/
+.vscode/
