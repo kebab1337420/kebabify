@@ -1,1 +1,8 @@
 /target
+# Local Cloudflare session captures (never commit cookies)
+kebabify_cookies.txt
+kebaccify_cookies.txt
+cookies.txt
+# Spotless: patch backups created next to the repo during tests
+.kebabify_backups/
+.kebaccify_backups/

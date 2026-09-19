@@ -65,7 +65,10 @@ impl AudioProxy {
             .await
             .context("Failed to bind audio proxy. Port may be in use.")?;
 
-        println!("[kebabify] Audio proxy listening on {}:{}", PROXY_HOST, self.port);
+        println!(
+            "[kebabify] Audio proxy listening on {}:{}",
+            PROXY_HOST, self.port
+        );
 
         loop {
             // Check the latched flag before each select: if a /shutdown arrived
@@ -94,8 +97,13 @@ impl AudioProxy {
             let semaphore = self.semaphore.clone();
 
             tokio::spawn(async move {
-                let _permit = semaphore.acquire().await;
-                if let Err(e) = handle_client(socket, current_track, shutting_down, shutdown, client).await
+                // Holds the permit for the whole connection. Fails only if the
+                // semaphore was closed during shutdown — then drop the conn.
+                let Ok(_permit) = semaphore.acquire().await else {
+                    return;
+                };
+                if let Err(e) =
+                    handle_client(socket, current_track, shutting_down, shutdown, client).await
                 {
                     eprintln!("[kebabify] Proxy error: {}", e);
                 }
@@ -118,7 +126,10 @@ impl AudioProxy {
             .await
             .context("Failed to contact audio proxy for shutdown")?;
         if !resp.status().is_success() {
-            return Err(anyhow!("Proxy shutdown request returned HTTP {}", resp.status()));
+            return Err(anyhow!(
+                "Proxy shutdown request returned HTTP {}",
+                resp.status()
+            ));
         }
         Ok(())
     }
@@ -300,7 +311,8 @@ async fn handle_client(
     // indicator is reset afterwards so /health never reports a ghost track.
     let mut response_started = false;
     let result: Result<()> = async {
-        let lucida_stream = crate::lucida::open_stream(&client, &spotify_url, range_header.as_deref()).await?;
+        let lucida_stream =
+            crate::lucida::open_stream(&client, &spotify_url, range_header.as_deref()).await?;
         let mut audio_resp = lucida_stream.response;
 
         let content_type = audio_resp
@@ -311,7 +323,10 @@ async fn handle_client(
             .to_string();
 
         if !content_type.contains("flac") && !content_type.contains("audio") {
-            eprintln!("[kebabify] WARNING: content-type is not FLAC: {}", content_type);
+            eprintln!(
+                "[kebabify] WARNING: content-type is not FLAC: {}",
+                content_type
+            );
         }
 
         // Send valid HTTP response headers. The terminating \r\n\r\n is
@@ -360,7 +375,10 @@ async fn handle_client(
         }
 
         write_half.flush().await?;
-        println!("[kebabify] Served FLAC for track {} ({} bytes)", tid, total_bytes);
+        println!(
+            "[kebabify] Served FLAC for track {} ({} bytes)",
+            tid, total_bytes
+        );
 
         Ok(())
     }
@@ -449,33 +467,39 @@ fn is_shutdown_origin(origin: &str) -> bool {
 }
 
 /// Extracts a Spotify track ID from a URL.
+///
+/// Only returns IDs that look like a real Spotify track ID (exactly 22
+/// base62 chars). Shorter fragments (e.g. `?id=abc`) are ignored so callers
+/// never build a bogus `open.spotify.com/track/abc` URL downstream.
 fn extract_track_id(url: &str) -> Option<String> {
-    // From the path: /tracks/{id}
+    // Structured parsing first (single parse, not one per lookup).
     if let Ok(parsed) = url::Url::parse(url) {
         let path = parsed.path();
-        if let Some(idx) = path.find("/tracks/") {
-            let start = idx + 8;
-            let rest = &path[start..];
-            let end = rest.find('/').unwrap_or(rest.len());
-            return Some(rest[..end].to_string());
+        for marker in ["/tracks/", "/track/"] {
+            if let Some(idx) = path.find(marker) {
+                let rest = &path[idx + marker.len()..];
+                let end = rest.find('/').unwrap_or(rest.len());
+                if is_track_id(&rest[..end]) {
+                    return Some(rest[..end].to_string());
+                }
+            }
         }
-    }
 
-    // From query parameters
-    if let Ok(parsed) = url::Url::parse(url) {
         if let Some(id) = parsed
             .query_pairs()
             .find(|(k, _)| k == "track_id" || k == "id" || k == "cid")
         {
-            return Some(id.1.to_string());
+            if is_track_id(&id.1) {
+                return Some(id.1.to_string());
+            }
         }
     }
 
     // Manual fallback — look for track IDs near known keys.
-    // Spotify track IDs are 22 chars of [a-zA-Z0-9].
     for key in &["track/", "tracks/", "track=", "id=", "track_id="] {
-        if let Some(idx) = url.find(key) {
-            let start = idx + key.len();
+        let mut search_from = 0;
+        while let Some(rel) = url[search_from..].find(key) {
+            let start = search_from + rel + key.len();
             let rest = &url[start..];
             let mut id_end = 0;
             for (i, c) in rest.char_indices() {
@@ -485,14 +509,24 @@ fn extract_track_id(url: &str) -> Option<String> {
                     break;
                 }
             }
-            let len = id_end.min(22);
-            if len > 0 {
-                return Some(rest[..len].to_string());
+            // Boundary check: a 32-char hex UUID in /track/{uuid} must not
+            // count — only an exact 22-char base62 token does.
+            let next_is_alnum = rest[id_end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
+            if id_end == 22 && !next_is_alnum && is_track_id(&rest[..22]) {
+                return Some(rest[..22].to_string());
             }
+            search_from = start + id_end.max(1);
         }
     }
 
     None
+}
+
+fn is_track_id(s: &str) -> bool {
+    s.len() == 22 && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -526,14 +560,20 @@ mod tests {
     #[test]
     fn track_id_from_tracks_path() {
         assert_eq!(
-            extract_track_id(&format!("https://audio-spclient.wg.spotify.com/tracks/{}", TRACK_ID)),
+            extract_track_id(&format!(
+                "https://audio-spclient.wg.spotify.com/tracks/{}",
+                TRACK_ID
+            )),
             Some(TRACK_ID.to_string())
         );
     }
 
     #[test]
     fn track_id_from_track_query() {
-        assert_eq!(extract_track_id(&format!("?track={}", TRACK_ID)), Some(TRACK_ID.to_string()));
+        assert_eq!(
+            extract_track_id(&format!("?track={}", TRACK_ID)),
+            Some(TRACK_ID.to_string())
+        );
         assert_eq!(
             extract_track_id(&format!("https://open.spotify.com/track?id={}", TRACK_ID)),
             Some(TRACK_ID.to_string())
@@ -554,12 +594,33 @@ mod tests {
     }
 
     #[test]
+    fn track_id_rejects_short_fragments() {
+        assert_eq!(
+            extract_track_id("https://open.spotify.com/track?id=abc"),
+            None
+        );
+        assert_eq!(extract_track_id("?track=abc"), None);
+    }
+
+    #[test]
+    fn track_id_rejects_uuid() {
+        // 32-char hex file UUIDs ride in /track/{uuid} URLs — not track IDs.
+        assert_eq!(
+            extract_track_id("https://audio-spotify.com/track/1234567890abcdef1234567890abcdef"),
+            None
+        );
+    }
+
+    #[test]
     fn allowed_origins_are_strict() {
         assert!(is_allowed_origin("https://open.spotify.com"));
         assert!(is_allowed_origin("https://xpui.app.spotify.com"));
         assert!(is_allowed_origin("app://spotify"));
         assert!(is_allowed_origin("spotify://user"));
-        assert!(is_allowed_origin(&format!("http://{}:{}", PROXY_HOST, PROXY_PORT)));
+        assert!(is_allowed_origin(&format!(
+            "http://{}:{}",
+            PROXY_HOST, PROXY_PORT
+        )));
         assert!(!is_allowed_origin("http://127.0.0.1:9999"));
         assert!(!is_allowed_origin("http://192.168.1.10:18900"));
         assert!(!is_allowed_origin("https://evil.example"));
@@ -579,7 +640,10 @@ mod tests {
     #[test]
     fn header_parsers() {
         let block = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:18900\r\nOrigin: https://open.spotify.com\r\nRange: bytes=0-1023\r\n\r\n";
-        assert_eq!(request_origin(block).as_deref(), Some("https://open.spotify.com"));
+        assert_eq!(
+            request_origin(block).as_deref(),
+            Some("https://open.spotify.com")
+        );
         assert_eq!(request_range(block).as_deref(), Some("bytes=0-1023"));
         assert_eq!(request_origin("GET / HTTP/1.1\r\n\r\n"), None);
         assert_eq!(request_range("GET / HTTP/1.1\r\n\r\n"), None);
