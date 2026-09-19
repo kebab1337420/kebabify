@@ -1,0 +1,44 @@
+[package]
+name = "kebabify"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alaric <alaric@kebaccify.dev>"]
+description = "Spicetify-like extension for Spotify: ad-free, lossless audio via lucida.to API"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+
+# HTTP client for the audio proxy
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Serialization
+serde_json = "1"
+
+# Page token is base64-of-base64 (atob(atob(j)) in the lucida client)
+base64 = "0.22"
+
+# Chrome DevTools Protocol (cookie import from a real browser)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+# Utility
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+open = "5"
+url = "2"
+which = "8"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = 3

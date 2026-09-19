@@ -1,0 +1,615 @@
+// kebabify_ext.js — Extensions for Spotify client
+// Intercepte les requêtes audio de Spotify et redirige vers lucida.to pour du FLAC.
+
+(function() {
+    'use strict';
+
+    // Single-instance guard: if a previous copy of this script (or the legacy
+    // kebaccify script) already initialized, remove any legacy badge and stop.
+    // The legacy kebaccify inline block uses id 'kebaccify-badge' — always
+    // remove it so only one badge ever shows.
+    function removeLegacyBadge() {
+        var legacy = document.getElementById('kebaccify-badge');
+        if (legacy) legacy.remove();
+    }
+    if (window.__kebabifyLoaded) {
+        removeLegacyBadge();
+        return;
+    }
+    window.__kebabifyLoaded = true;
+    removeLegacyBadge();
+
+    // ===== State =====
+    var flacPriority = true;
+    var lastTrackId = null;
+    var currentSpotifyTrackId = null;
+    var playbarButton = null;
+    var playbarInterval = null;
+    var flacVerified = false;
+    var proxyAlive = false;
+    // Module-level guards so observers/wrappers are installed only once.
+    var fetchPatched = false;
+    var xhrPatched = false;
+    var globalAudioObserver = null;
+    var globalAdObserver = null;
+
+    // SVG icons
+    var svgOff = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="12" x2="12" y2="16"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+    var svgSpeaker = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="margin-right:4px"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
+    var svgCheck = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="margin-right:4px"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
+    var svgMuted = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
+
+    // ===== Proxy Health Check =====
+    function checkProxyHealth() {
+        fetch(PROXY_BASE + 'health')
+            .then(function(resp) {
+                var alive = resp.ok;
+                var healthy = alive;
+                resp.json().then(function(data) {
+                    if (alive && data && data.flac) healthy = true;
+                    applyProxyHealth(healthy);
+                }).catch(function() {
+                    applyProxyHealth(alive);
+                });
+            })
+            .catch(function() {
+                // CSP or network error — never assume a leftover proxified src
+                // proves the proxy is alive. Honest "down" beats a green lie.
+                applyProxyHealth(false);
+            });
+    }
+
+    function applyProxyHealth(alive) {
+        if (alive === proxyAlive) return;
+        proxyAlive = alive;
+        if (!alive) {
+            flacVerified = false;
+        }
+        console.log('[kebabify] Proxy ' + (alive ? 'alive' : 'unreachable'));
+        refreshBadge();
+    }
+
+    // ===== FLAC Mode Toggle =====
+    window.__kebabifyToggleFlacMode = function() {
+        flacPriority = !flacPriority;
+        console.log('[kebabify] FLAC priority mode:', flacPriority ? 'ON' : 'OFF');
+        localStorage.setItem('kebabify-flac-priority', flacPriority ? 'on' : 'off');
+        localStorage.setItem('kebaccify-flac-priority', flacPriority ? 'on' : 'off');
+        refreshBadge();
+        reapplyPatchesNow();
+        if (!flacPriority) {
+            flacVerified = false;
+        }
+    };
+
+    window.__kebaccifyToggleFlacMode = window.__kebabifyToggleFlacMode;
+
+    var saved = localStorage.getItem('kebabify-flac-priority');
+    if (saved === null) saved = localStorage.getItem('kebaccify-flac-priority');
+    if (saved === 'off') flacPriority = false;
+
+    // ===== Local proxy for FLAC audio streaming =====
+    // When the kebabify Rust binary runs, it starts a local HTTP proxy on
+    // 127.0.0.1:18900 that proxies Spotify audio URLs through lucida.to (FLAC).
+    var PROXY_HOST = '127.0.0.1';
+    var PROXY_PORT = 18900;
+    var PROXY_BASE = 'http://' + PROXY_HOST + ':' + PROXY_PORT + '/';
+    var PROXY_AUTH = PROXY_HOST + ':' + PROXY_PORT;
+
+    // ===== Intercept fetch + XHR for FLAC redirect to local proxy =====
+    function patchAudioUrls() {
+        if (!flacPriority) return;
+
+        try {
+            if (!fetchPatched) {
+                fetchPatched = true;
+                var originalFetch = window.fetch;
+                window.fetch = function(input, init) {
+                    if (!flacPriority) return originalFetch.call(this, input, init);
+                    var url = typeof input === 'string' ? input : (input && input.url) || '';
+                    if (isSpotifyAudioRequest(url)) {
+                        var redirected = tryRedirectToProxy(url);
+                        if (redirected) {
+                            input = redirected;
+                        }
+                    }
+                    return originalFetch.call(this, input, init);
+                };
+            }
+
+            if (!xhrPatched) {
+                xhrPatched = true;
+                var originalXHROpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                    if (flacPriority && isSpotifyAudioRequest(url)) {
+                        var redirected = tryRedirectToProxy(url);
+                        if (redirected) url = redirected;
+                    }
+                    return originalXHROpen.apply(this, [method, url, ...rest]);
+                };
+            }
+        } catch(e) {
+            console.warn('[kebabify] Audio URL patching failed:', e);
+        }
+    }
+
+    function isSpotifyAudioRequest(url) {
+        if (!url) return false;
+        return url.includes('audio-spclient') ||
+               url.includes('spclient.wg.spotify.com') ||
+               url.includes('streaming.spotify.com') ||
+               (url.includes('spotify.com') && (url.includes('audio') || url.includes('stream')));
+    }
+
+    // Redirect Spotify audio URL to the local proxy (which fetches FLAC via lucida.to)
+    function tryRedirectToProxy(url) {
+        var trackId = extractTrackId(url);
+        if ((!trackId || !isValidSpotifyTrackId(trackId)) &&
+            typeof window.Spicetify !== 'undefined' && window.Spicetify.Player && window.Spicetify.Player.trackID) {
+            trackId = window.Spicetify.Player.trackID;
+            if (trackId && trackId.indexOf('spotify:track:') === 0) {
+                trackId = trackId.replace('spotify:track:', '');
+            }
+        }
+        // The audio URL carries a file UUID, not the Spotify track ID — prefer
+        // the now-playing track (read from the DOM) over any UUID extracted
+        // from the media URL.
+        if (!isValidSpotifyTrackId(trackId)) trackId = currentSpotifyTrackId;
+        if (!isValidSpotifyTrackId(trackId)) return null;
+
+        console.log('[kebabify] FLAC: proxying to local for track', trackId);
+        return PROXY_BASE + '?track=' + trackId;
+    }
+
+    function isValidSpotifyTrackId(id) {
+        return typeof id === 'string' && /^[A-Za-z0-9]{22}$/.test(id);
+    }
+
+    // Reads the current track ID from the now-playing widget of the Spotify UI.
+    // Works without Spicetify: the widget contains a link like
+    // spotify:track:11dF... (the audio element's URL only holds a file UUID).
+    function readNowPlayingTrackId() {
+        var el = document.querySelector('[data-testid="now-playing-widget"] a[href*="spotify:track:"], a[href^="spotify:track:"]');
+        if (!el) return null;
+        var href = el.getAttribute('href') || el.href || '';
+        var m = href.match(/spotify:track:([A-Za-z0-9]{22})/);
+        return m ? m[1] : null;
+    }
+
+    // Extract a *valid* Spotify track ID from a URL. The regexes are anchored
+    // to 22 base62 chars: a 32-char hex UUID in /track/{uuid} must NOT count.
+    function extractTrackId(url) {
+        if (!url) return null;
+        var m = url.match(/track\/([A-Za-z0-9]{22})/);
+        if (m && isValidSpotifyTrackId(m[1])) return m[1];
+        m = url.match(/[?&]id=([A-Za-z0-9]{22})/);
+        if (m && isValidSpotifyTrackId(m[1])) return m[1];
+        m = url.match(/[?&]cid=([A-Za-z0-9]{22})/);
+        if (m && isValidSpotifyTrackId(m[1])) return m[1];
+        m = url.match(/spotify:track:([A-Za-z0-9]{22})/);
+        if (m) return m[1];
+        return null;
+    }
+
+    // ===== Audio element interception =====
+    function interceptAudioElements() {
+        if (globalAudioObserver) return;
+
+        globalAudioObserver = new MutationObserver(function() {
+            try {
+                var all = document.querySelectorAll('audio, video');
+                // Release observers of media elements that left the DOM —
+                    // a removed element gets no further mutation callbacks, so
+                    // this is the only guaranteed cleanup point.
+                    all.forEach(function(media) {
+                        if (media._kebabifyObserver && !media.isConnected) {
+                            media._kebabifyObserver.disconnect();
+                            media._kebabifyObserver = null;
+                            media._kebabifyPatched = false;
+                        }
+                    });
+                    all.forEach(function(media) {
+                        if (!media._kebabifyPatched) {
+                            media._kebabifyPatched = true;
+                            patchAudioElement(media);
+                        }
+                    });
+            } catch(e) {}
+        });
+        if (document.body) globalAudioObserver.observe(document.body, { childList: true, subtree: true });
+
+        setTimeout(function() {
+            var all = document.querySelectorAll('audio, video');
+            all.forEach(function(media) {
+                if (!media._kebabifyPatched) {
+                    media._kebabifyPatched = true;
+                    patchAudioElement(media);
+                }
+            });
+        }, 1000);
+    }
+
+    function patchAudioElement(media) {
+        try {
+            // Ahead of the observer: a <audio> inserted by React already
+            // carries its src — no attribute mutation will follow, so the
+            // current (Spotify) URL would never be redirected. Handle it now.
+            if (flacPriority && media.src && isSpotifyAudioRequest(media.src)) {
+                var existing = tryRedirectToProxy(media.src);
+                if (existing) {
+                    media.src = existing;
+                }
+            }
+
+            // Watch for src changes and redirect Spotify audio URLs to the proxy.
+            var innerObserver = new MutationObserver(function() {
+                try {
+                    // Element was removed from the document — release the observer
+                    // and let it be re-patched if it ever comes back.
+                    if (!media.isConnected) {
+                        innerObserver.disconnect();
+                        media._kebabifyObserver = null;
+                        media._kebabifyPatched = false;
+                        return;
+                    }
+                    if (flacPriority && media.src && isSpotifyAudioRequest(media.src)) {
+                        var newSrc = tryRedirectToProxy(media.src);
+                        if (newSrc) {
+                            media.src = newSrc;
+                        }
+                    }
+                } catch(e) {}
+            });
+            innerObserver.observe(media, { attributes: true, childList: true, subtree: true });
+            media._kebabifyObserver = innerObserver;
+        } catch(e) {}
+    }
+
+    // ===== Playbar Button using Spicetify =====
+    function injectPlaybarButton() {
+        if (playbarInterval) {
+            try { clearInterval(playbarInterval); } catch(e) {}
+            playbarInterval = null;
+        }
+        if (playbarButton) {
+            try { playbarButton.deregister(); } catch(e) {}
+            playbarButton = null;
+        }
+
+        if (typeof window.Spicetify === 'undefined' || !window.Spicetify.Playbar || !window.Spicetify.Playbar.Button) {
+            injectFallbackBadge();
+            return;
+        }
+
+        try {
+            var label = flacPriority ? 'kebabify FLAC: Actif' : 'kebabify FLAC: Inactif';
+            var initialIcon;
+            if (!flacPriority) initialIcon = svgMuted;
+            else if (flacVerified) initialIcon = svgCheck;
+            else if (proxyAlive) initialIcon = svgSpeaker;
+            else initialIcon = svgOff;
+            var iconText = initialIcon + 'KB';
+
+            playbarButton = new window.Spicetify.Playbar.Button(
+                label,
+                iconText,
+                function() { window.__kebabifyToggleFlacMode(); }
+            );
+
+            if (playbarButton.element) {
+                var btn = playbarButton.element;
+                var span = btn.querySelector('span');
+
+                btn.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
+                btn.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+                btn.style.fontSize = '11px';
+                btn.style.fontWeight = '700';
+                btn.style.padding = '2px 6px';
+                btn.style.minWidth = '44px';
+                btn.style.height = '32px';
+                btn.style.display = 'inline-flex';
+                btn.style.alignItems = 'center';
+                btn.style.justifyContent = 'center';
+            }
+
+            playbarInterval = setInterval(function() {
+                if (playbarButton && playbarButton.element) {
+                    var btn = playbarButton.element;
+                    var iconSpan = btn.querySelector('span');
+                    if (iconSpan) {
+                        var ic;
+                        if (!flacPriority) ic = svgMuted;
+                        else if (flacVerified) ic = svgCheck;
+                        else if (proxyAlive) ic = svgSpeaker;
+                        else ic = svgOff;
+                        iconSpan.innerHTML = ic + 'KB';
+                    }
+                    btn.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
+                    btn.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+                }
+            }, 1000);
+
+        } catch(e) {
+            console.warn('[kebabify] Playbar button failed:', e);
+            playbarButton = null;
+            injectFallbackBadge();
+        }
+    }
+
+    // ===== Fallback Badge (clickable button) =====
+    function injectFallbackBadge() {
+        removeLegacyBadge();
+        var existing = document.getElementById('kebabify-badge');
+        if (existing) { existing.onclick = null; existing.remove(); }
+
+        var badge = document.createElement('button');
+        badge.id = 'kebabify-badge';
+        badge.type = 'button';
+        badge.setAttribute('data-kebabify', 'true');
+        badge.setAttribute('aria-label', 'kebabify FLAC mode');
+        badge.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
+        badge.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+        badge.setAttribute('data-kebabify-proxy', proxyAlive ? 'true' : 'false');
+        updateBadgeContent(badge);
+
+        badge.onclick = function(e) {
+            e.stopPropagation(); e.preventDefault();
+            window.__kebabifyToggleFlacMode();
+            return false;
+        };
+
+        var playbar = findElement(['.main-nowPlayingBar', '.main-nowPlayingBar-right', '[data-testid="now-playing"]', '.g48hdQBsdIDHMBpt']);
+        if (playbar && playbar.parentNode) {
+            playbar.parentNode.insertBefore(badge, playbar.nextSibling);
+        } else if (document.body) {
+            document.body.appendChild(badge);
+        }
+    }
+
+    function updateBadgeContent(el) {
+        if (!el) return;
+        var icon, label, title;
+        if (flacPriority && proxyAlive && flacVerified) {
+            icon = svgCheck;
+            label = 'KB';
+            title = '\u2713 FLAC \u2014 kebabify';
+            el.className = 'flac-on verified';
+        } else if (flacPriority && proxyAlive) {
+            icon = svgSpeaker;
+            label = 'KB';
+            title = '\u2026 FLAC mode actif';
+            el.className = 'flac-on';
+        } else if (flacPriority) {
+            icon = svgOff;
+            label = 'KB';
+            title = 'FLAC mode actif \u2014 proxy indisponible';
+            el.className = 'flac-on proxy-down';
+        } else {
+            icon = svgMuted;
+            label = 'KB';
+            title = 'kebabify: FLAC d\u00e9sactiv\u00e9 (cliquer pour activer)';
+            el.className = 'flac-off';
+        }
+        el.innerHTML = '<span class="badge-icon">' + icon + '</span><span class="badge-text">' + label + '</span>';
+        el.title = title;
+    }
+
+    function refreshBadge() {
+        removeLegacyBadge();
+        // Update playbar button
+        if (playbarButton && playbarButton.element) {
+            var btn = playbarButton.element;
+            btn.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
+            btn.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+            btn.setAttribute('data-kebabify-proxy', proxyAlive ? 'true' : 'false');
+            var iconSpan = btn.querySelector('span');
+            if (iconSpan) {
+                var icon;
+                if (!flacPriority) icon = svgMuted;
+                else if (flacVerified) icon = svgCheck;
+                else if (proxyAlive) icon = svgSpeaker;
+                else icon = svgOff;
+                iconSpan.innerHTML = icon + 'KB';
+            }
+        }
+        // Update fallback badge
+        var badge = document.getElementById('kebabify-badge');
+        if (badge) {
+            badge.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
+            badge.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+            badge.setAttribute('data-kebabify-proxy', proxyAlive ? 'true' : 'false');
+            updateBadgeContent(badge);
+        }
+        updateVerifiedIndicator();
+    }
+
+    function updateVerifiedIndicator() {
+        var badge = document.getElementById('kebabify-badge');
+        if (badge) {
+            badge.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+        }
+        if (playbarButton && playbarButton.element) {
+            playbarButton.element.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+        }
+    }
+
+    function findElement(selectors) {
+        for (var i = 0; i < selectors.length; i++) {
+            var el = document.querySelector(selectors[i]);
+            if (el) return el;
+        }
+        return null;
+    }
+
+    function reapplyPatchesNow() {
+        // Re-apply audio URL interception
+        patchAudioUrls();
+        if (flacPriority) {
+            // Re-inject badge with new state
+            if (typeof window.Spicetify !== 'undefined' && window.Spicetify.Playbar && window.Spicetify.Playbar.Button) {
+                injectPlaybarButton();
+            } else {
+                injectFallbackBadge();
+            }
+            flacVerified = false;
+        } else {
+            flacVerified = false;
+        }
+    }
+
+    // ===== Audio Monitoring =====
+    function monitorPlayback() {
+        setInterval(function() {
+            try {
+                var nowId = readNowPlayingTrackId();
+                if (nowId && nowId !== currentSpotifyTrackId) {
+                    currentSpotifyTrackId = nowId;
+                    console.log('[kebabify] Now playing track:', nowId);
+                }
+                var anyPlaying = false;
+                var proxifiedPlaying = false;
+                var audioElements = document.querySelectorAll('audio');
+                for (var i = 0; i < audioElements.length; i++) {
+                    var a = audioElements[i];
+                    if (!a.paused && !a.ended && a.readyState >= 2 && a.currentTime > 0) {
+                        anyPlaying = true;
+                        if (a.src && a.src.indexOf(PROXY_AUTH) !== -1) proxifiedPlaying = true;
+                    }
+                }
+                var videos = document.querySelectorAll('video');
+                for (var j = 0; j < videos.length; j++) {
+                    var v = videos[j];
+                    if (!v.paused && !v.ended && v.readyState >= 2 && v.currentTime > 0) {
+                        anyPlaying = true;
+                        if (v.src && v.src.indexOf(PROXY_AUTH) !== -1) proxifiedPlaying = true;
+                    }
+                }
+                if (!anyPlaying && typeof window.Spicetify !== 'undefined' && window.Spicetify.Player) {
+                    try {
+                        var s = window.Spicetify.Player;
+                        var isPlaying = !!(s._state && !s._state.isPaused);
+                        if (!isPlaying && typeof s.isPlaying === 'function') isPlaying = s.isPlaying();
+                        if (isPlaying && s.trackID) {
+                            if (s.trackID !== lastTrackId) lastTrackId = s.trackID;
+                            anyPlaying = true;
+                        }
+                    } catch(e) {}
+                }
+                // Verdict: a proxified stream in flight always wins — a
+                // secondary non-proxified element (preview, ad) must not
+                // flash the badge off while FLAC is actually playing.
+                if (proxifiedPlaying) {
+                    if (flacPriority && !flacVerified) {
+                        flacVerified = true;
+                        updateVerifiedIndicator();
+                    }
+                } else if (anyPlaying && flacPriority && flacVerified) {
+                    flacVerified = false;
+                    updateVerifiedIndicator();
+                }
+                if (!anyPlaying) lastTrackId = null;
+            } catch(e) {}
+        }, 1000);
+    }
+
+    // ===== Other Features =====
+    function blockAds() {
+        if (globalAdObserver) return;
+
+        globalAdObserver = new MutationObserver(function(mutations) {
+            mutations.forEach(function(m) {
+                m.addedNodes.forEach(function(node) {
+                    if (node.nodeType !== 1) return;
+                    var selectors = ['[data-testid="ad"]','.ad-container','.ad-showing','.sponsor','.google-ads','.adsbygoogle'];
+                    selectors.forEach(function(sel) {
+                        if (node.matches && node.matches(sel)) node.style.display = 'none';
+                        var matches = node.querySelectorAll ? node.querySelectorAll(sel) : [];
+                        for (var i = 0; i < matches.length; i++) matches[i].style.display = 'none';
+                    });
+                });
+            });
+        });
+        if (document.body) globalAdObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function removeSkipLimit() {
+        try {
+            var proto = Object.getPrototypeOf(Object.getPrototypeOf(window));
+            if (proto && proto.hasOwnProperty('skip')) delete proto.skip;
+        } catch (e) {}
+    }
+
+    // ===== Initialization =====
+    function doInit() {
+        console.log('[kebabify] Initializing... FLAC priority:', flacPriority ? 'ON' : 'OFF');
+
+        var attempts = 0;
+        var interval = setInterval(function() {
+            attempts++;
+            if (typeof window.Spicetify !== 'undefined' && window.Spicetify.Playbar && window.Spicetify.Playbar.Button) {
+                clearInterval(interval);
+                injectPlaybarButton();
+                return;
+            }
+            if (attempts >= 100) {
+                clearInterval(interval);
+                injectFallbackBadge();
+            }
+        }, 250);
+
+        setInterval(function() {
+            if (!document.getElementById('kebabify-badge') && !playbarButton) {
+                if (typeof window.Spicetify !== 'undefined' && window.Spicetify.Playbar && window.Spicetify.Playbar.Button) {
+                    injectPlaybarButton();
+                } else {
+                    injectFallbackBadge();
+                }
+            }
+        }, 2000);
+
+        patchAudioUrls();
+        interceptAudioElements();
+        blockAds();
+        removeSkipLimit();
+        monitorPlayback();
+
+        // Start proxy health check every 3 seconds
+        checkProxyHealth();
+        setInterval(checkProxyHealth, 3000);
+
+        var lastPath = location.pathname;
+        setInterval(function() {
+            if (location.pathname !== lastPath) {
+                lastPath = location.pathname;
+                if (typeof window.Spicetify !== 'undefined' && window.Spicetify.Playbar && window.Spicetify.Playbar.Button) {
+                    injectPlaybarButton();
+                } else {
+                    injectFallbackBadge();
+                }
+                blockAds();
+                removeSkipLimit();
+                patchAudioUrls();
+                interceptAudioElements();
+            }
+        }, 1000);
+    }
+
+    var initialized = false;
+    function init() {
+        if (initialized) return;
+        initialized = true;
+        doInit();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function() { setTimeout(init, 500); });
+    } else {
+        setTimeout(init, 500);
+    }
+    var bodyPoll = setInterval(function() {
+        if (document.body) {
+            clearInterval(bodyPoll);
+            setTimeout(function() { if (!initialized) init(); }, 500);
+        }
+    }, 100);
+})();

@@ -1,0 +1,214 @@
+/* kebabify_theme.css — Spotify dark theme modifications */
+/* This CSS is injected into the Spotify client to apply a dark theme
+   with green accents, matching the Spotify desktop aesthetic. */
+
+/* Dark backgrounds */
+:root,
+:root[data-theme="light"] {
+    --background-main: #121212;
+    --background-main-secondary: #181818;
+    --background-main-elevated: #1f1f1f;
+    --background-main-elevated-tertiary: #252525;
+    --text-main: #ffffff;
+    --text-sub-main-1: #b3b3b3;
+    --text-sub-main-2: #b3b3b3;
+    --text-sub-main-3: #7a7a7a;
+    --text-main-1: #ffffff;
+    --text-main-2: #ffffff;
+    --text-main-3: #b3b3b3;
+    --text-main-4: #7a7a7a;
+    --green-main: #1ED760;
+    --main-black: #121212;
+    --main-black-secondary: #181818;
+    --component-bg: #121212;
+    --side-border: #222222;
+    --line-clamp-line: #222222;
+    --border-main: #222222;
+    --border-main-1: #222222;
+    --border-main-2: #222222;
+    --border-main-3: #222222;
+    --border-main-4: #222222;
+    --border-opacity: #222222;
+    --border-unselected-button: #222222;
+    --border-unselected-button-elevation: #222222;
+    --border-button-toggle-selected: #222222;
+    --control-corner-clickable: #222222;
+    --control-interaction-click: #222222;
+    --control-interaction-main-x: #222222;
+    --colored-button-bg: #1ED760;
+    --colored-button-text: #000000;
+    --colored-button-disabled-bg: #454545;
+    --colored-button-disabled-text: #7a7a7a;
+    --text-negative: #f3727f;
+    --text-negative-soft: #f3727f;
+    --text-warning: #ffa42b;
+    --text-warning-soft: #ffa42b;
+    --text-alert: #539df5;
+    --text-alert-soft: #539df5;
+    --text-positive: #1ED760;
+    --text-positive-soft: #1ED760;
+    --text-deprecated-white: #ffffff;
+    --text-deprecated-light: #b3b3b3;
+    --text-deprecated-dark: #7a7a7a;
+    --text-deprecated-dim: #7a7a7a;
+    --text-deprecated-whisper: #5a5a5a;
+    --text-deprecated-micro: #5a5a5a;
+    --decoration-subsongdurationbar-color: #1ED760;
+    --decoration-subsongdurationbar-background-color: #454545;
+    --decoration-surpressor-bottom-bar-separator: #222222;
+    --decoration-main-2: #181818;
+    --decoration-main-1: rgba(0, 0, 0, 0.5);
+    --decoration-main: transparent;
+    --decoration-sub-main-1: transparent;
+    --decoration-sub-main-2: transparent;
+    --decoration-sub-main-3: transparent;
+    --decoration-sub-main-4: transparent;
+    --decoration-sub-main-5: transparent;
+    --decoration-card: #181818;
+    --decoration-card-elevation: 0;
+    --decoration-header: #121212;
+    --decoration-header-elevation: 0;
+    --decoration-header-elevation-highlight: rgba(0, 0, 0, 0.5);
+    --decoration-header-separator: #222222;
+    --decoration-header-shadow: rgba(0, 0, 0, 0.5);
+    --scrollbar-main: rgba(255, 255, 255, 0.2);
+    --scrollbar-main-hover: rgba(255, 255, 255, 0.3);
+    --scrollbar-main-elevation: rgba(0, 0, 0, 0.5);
+    --scrollbar-main-elevation-hover: rgba(255, 255, 255, 0.3);
+    --scrollbar-main-opacity: rgba(0, 0, 0, 0.3);
+    --scrollbar-main-opacity-hover: rgba(0, 0, 0, 0.5);
+}
+
+/* =====================================================
+   kebabify Badge — pill in the playbar area
+   Backgroundless: blends with Spotify's own background.
+   Green when FLAC is ON and verified, outlined green when
+   armed, amber when the proxy is down, neutral when off.
+   Inline in the flow (never fixed/top-left).
+   ===================================================== */
+#kebabify-badge {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 0;
+    height: 24px !important;
+    padding: 0 6px !important;
+    margin: 0 0 0 8px !important;
+    border-radius: 12px !important;
+    border: none !important;
+    background: transparent !important;
+    color: #b3b3b3 !important;
+    font-family: 'Spotify Circular', Arial, sans-serif !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.4px !important;
+    cursor: pointer !important;
+    pointer-events: auto !important;
+    user-select: none !important;
+    -webkit-user-drag: none !important;
+    touch-action: manipulation !important;
+    transition: background 0.15s ease, color 0.15s ease,
+                transform 0.15s ease !important;
+    transform: scale(1) !important;
+    opacity: 1 !important;
+}
+
+#kebabify-badge:hover {
+    background: rgba(255, 255, 255, 0.06) !important;
+    transform: scale(1.05) !important;
+}
+
+#kebabify-badge:active {
+    transform: scale(0.95) !important;
+}
+
+#kebabify-badge .badge-icon {
+    display: inline-flex !important;
+    align-items: center !important;
+}
+
+#kebabify-badge .badge-icon svg {
+    display: block !important;
+    margin-right: 4px !important;
+}
+
+/* FLAC ON — armed, streaming through the proxy not yet verified.
+   Backgroundless: color-only, blends into the app background. */
+#kebabify-badge.flac-on,
+#kebabify-badge[data-kebabify-flac="on"] {
+    color: #1ED760 !important;
+    background: transparent !important;
+}
+
+/* FLAC ON + verified — solid green text, still no background */
+#kebabify-badge.flac-on.verified {
+    color: #1ED760 !important;
+    background: transparent !important;
+    animation: none !important;
+}
+
+/* Proxy down — amber warning state */
+#kebabify-badge.flac-on.proxy-down {
+    color: #ffa42b !important;
+    background: transparent !important;
+    animation: none !important;
+}
+
+/* FLAC OFF — muted, no animation */
+#kebabify-badge.flac-off,
+#kebabify-badge[data-kebabify-flac="off"] {
+    opacity: 0.8 !important;
+    animation: none !important;
+}
+
+/* Badge text */
+#kebabify-badge .badge-text {
+    font-family: 'Spotify Circular', Arial, sans-serif !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+}
+
+/* =====================================================
+   Spicetify Playbar Button styling
+   ===================================================== */
+.main-nowPlayingBar-right .main-genericButton-button > span {
+    font-family: 'Spotify Circular', Arial, sans-serif !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+}
+
+/* When FLAC priority is ON, tint the playbar button green */
+.main-nowPlayingBar-right .main-genericButton-button[data-kebabify-flac="on"] > span {
+    color: #1ED760 !important;
+}
+
+/* When FLAC is OFF, color gray */
+.main-nowPlayingBar-right .main-genericButton-button[data-kebabify-flac="off"] > span {
+    color: #7a7a7a !important;
+}
+
+/* Verified FLAC stays green (icon switches to checkmark in JS) */
+.main-nowPlayingBar-right .main-genericButton-button[data-kebabify-flac="on"][data-kebabify-verified="true"] > span {
+    color: #1ED760 !important;
+}
+
+/* Proxy down — amber, and it overrides the green so the user always
+   sees the honest state on the Spicetify path too. */
+.main-nowPlayingBar-right .main-genericButton-button[data-kebabify-flac="on"][data-kebabify-proxy="false"] > span {
+    color: #ffa42b !important;
+}
+
+/* Always clickable, never surfaced with a chip background — the KB badge
+   is the only FLAC indicator and blends into the playbar. */
+.main-nowPlayingBar-right .main-genericButton-button {
+    cursor: pointer !important;
+    pointer-events: auto !important;
+    background: transparent !important;
+    border: none !important;
+}
+
+.main-nowPlayingBar-right .main-genericButton-button > span {
+    background: transparent !important;
+}
