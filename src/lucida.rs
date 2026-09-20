@@ -124,17 +124,32 @@ pub fn save_cookies(user_agent: &str, cookie_header: &str) -> Result<()> {
 }
 
 /// Applies the shared identity (captured UA + cookies, or the stock UA) to a
-/// lucida request.
+/// lucida request. Browser-shaped headers (Accept/Accept-Language/Referer)
+/// ride along: with Cloudflare in front, a bare UA+Cookie request looks
+/// scripted and draws challenges faster.
 fn identify(
     req: reqwest::RequestBuilder,
     session: Option<&CloudflareSession>,
 ) -> reqwest::RequestBuilder {
     let ua = session.map(|s| s.user_agent.as_str()).unwrap_or(USER_AGENT);
-    let req = req.header("User-Agent", ua);
+    let req = req
+        .header("User-Agent", ua)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://lucida.to/");
     match session {
         Some(s) => req.header("Cookie", &s.cookie),
         None => req,
     }
+}
+
+/// Whether a Cloudflare session is stored (new path or legacy fallback).
+/// Used at startup to warn instead of letting every track fail silently.
+pub fn has_session() -> bool {
+    load_session().is_some()
 }
 
 /// The lucida API endpoint for requesting a track stream.

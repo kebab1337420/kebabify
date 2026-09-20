@@ -106,14 +106,36 @@
                 var originalFetch = window.fetch;
                 window.fetch = function(input, init) {
                     if (!flacPriority) return originalFetch.call(this, input, init);
+                    var self = this;
                     var url = typeof input === 'string' ? input : (input && input.url) || '';
+                    var originalUrl = url;
                     if (isSpotifyAudioRequest(url)) {
                         var redirected = tryRedirectToProxy(url);
                         if (redirected) {
                             input = redirected;
                         }
                     }
-                    return originalFetch.call(this, input, init);
+                    return originalFetch.call(self, input, init).then(function(resp) {
+                        // Proxy failure (lucida down, missing cookies…) → retry
+                        // the native URL once so the track still plays, in
+                        // Spotify quality, instead of erroring out.
+                        if (flacPriority && resp && resp.status === 502 && isProxified(input) && originalUrl && originalUrl !== input) {
+                            console.warn('[kebabify] Proxy 502, falling back to native audio');
+                            flacVerified = false;
+                            refreshBadge();
+                            return originalFetch.call(self, originalUrl, init);
+                        }
+                        return resp;
+                    }, function(err) {
+                        // Network-level failure on a proxified URL → same fallback.
+                        if (flacPriority && isProxified(input) && originalUrl && originalUrl !== input) {
+                            console.warn('[kebabify] Proxy unreachable, falling back to native audio');
+                            flacVerified = false;
+                            refreshBadge();
+                            return originalFetch.call(self, originalUrl, init);
+                        }
+                        throw err;
+                    });
                 };
             }
 
@@ -163,6 +185,10 @@
 
     function isValidSpotifyTrackId(id) {
         return typeof id === 'string' && /^[A-Za-z0-9]{22}$/.test(id);
+    }
+
+    function isProxified(input) {
+        return typeof input === 'string' && input.indexOf(PROXY_AUTH) !== -1;
     }
 
     // Reads the current track ID from the now-playing widget of the Spotify UI.
@@ -235,10 +261,7 @@
             // carries its src — no attribute mutation will follow, so the
             // current (Spotify) URL would never be redirected. Handle it now.
             if (flacPriority && media.src && isSpotifyAudioRequest(media.src)) {
-                var existing = tryRedirectToProxy(media.src);
-                if (existing) {
-                    media.src = existing;
-                }
+                redirectMediaWithFallback(media);
             }
 
             // Watch for src changes and redirect Spotify audio URLs to the proxy.
@@ -253,16 +276,41 @@
                         return;
                     }
                     if (flacPriority && media.src && isSpotifyAudioRequest(media.src)) {
-                        var newSrc = tryRedirectToProxy(media.src);
-                        if (newSrc) {
-                            media.src = newSrc;
-                        }
+                        redirectMediaWithFallback(media);
                     }
                 } catch(e) {}
             });
             innerObserver.observe(media, { attributes: true, childList: true, subtree: true });
             media._kebabifyObserver = innerObserver;
         } catch(e) {}
+    }
+
+    // Redirect with a safety net: remember the native URL so a proxy failure
+    // restores Spotify audio instead of leaving silence. After a fallback the
+    // element is left alone for 30 s (else error → restore → redirect would
+    // hot-loop); FLAC is retried on the next track.
+    function redirectMediaWithFallback(media) {
+        if (media._kebabifyFallbackAt && Date.now() - media._kebabifyFallbackAt < 30000) return;
+        var newSrc = tryRedirectToProxy(media.src);
+        if (!newSrc || newSrc === media.src) return;
+        if (!media._kebabifyOriginalSrc) media._kebabifyOriginalSrc = media.src;
+        attachAudioFallback(media);
+        media.src = newSrc;
+    }
+
+    function attachAudioFallback(media) {
+        if (media._kebabifyFallbackAttached) return;
+        media._kebabifyFallbackAttached = true;
+        media.addEventListener('error', function() {
+            if (media._kebabifyOriginalSrc && media.src && media.src.indexOf(PROXY_AUTH) !== -1) {
+                console.warn('[kebabify] Proxy media failed, falling back to native audio');
+                flacVerified = false;
+                refreshBadge();
+                media._kebabifyFallbackAt = Date.now();
+                media.src = media._kebabifyOriginalSrc;
+                media._kebabifyOriginalSrc = null;
+            }
+        });
     }
 
     // ===== Playbar Button using Spicetify =====
