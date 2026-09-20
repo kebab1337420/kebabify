@@ -213,6 +213,15 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    // Without stored Cloudflare cookies every track fails at the
+                    // lucida handshake (HTTP 403 → proxy 502): warn now instead
+                    // of letting the user discover it track by track.
+                    if !lucida::has_session() {
+                        println!(
+                            "NOTE: no lucida.to cookies stored — FLAC playback will fail until you run `kebabify import-cookies`."
+                        );
+                    }
+
                     // Launch the patched Spotify client (uses Spotify's own UI)
                     println!("Launching Spotify...");
                     match open::that("spotify:") {

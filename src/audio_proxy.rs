@@ -207,8 +207,16 @@ async fn handle_client(
         return Err(anyhow!("Malformed HTTP request"));
     }
 
+    let method = parts[0];
     let path = parts[1];
     let origin = request_origin(&header_block);
+
+    // CORS preflight: Spotify's fetch() from xpui would otherwise be blocked
+    // before the real request happens. Answered for any path, no auth needed.
+    if method == "OPTIONS" {
+        write_preflight(&mut write_half, origin.as_deref()).await?;
+        return Ok(());
+    }
 
     // ===== Admin endpoints =====
     if path == "/health" {
@@ -273,12 +281,14 @@ async fn handle_client(
 
     // ===== Audio stream request =====
     // The JS sends us ?track=TRACKID, or the original Spotify URL.
+    // The query value is validated like any other source: an unchecked
+    // `track=` would otherwise build bogus open.spotify.com/track/… URLs.
     let track_id: Option<String> = if let Some(qpos) = path.find('?') {
         let query_str = &path[qpos + 1..];
         let mut found_track_id = None;
         for param in query_str.split('&') {
             let kv: Vec<&str> = param.splitn(2, '=').collect();
-            if kv.len() == 2 && kv[0] == "track" {
+            if kv.len() == 2 && kv[0] == "track" && is_track_id(kv[1]) {
                 found_track_id = Some(kv[1].to_string());
                 break;
             }
@@ -298,6 +308,7 @@ async fn handle_client(
     };
 
     let Some(tid) = track_id else {
+        write_bad_request(&mut write_half, origin.as_deref()).await?;
         return Err(anyhow!("Could not extract a track ID from request"));
     };
 
@@ -348,8 +359,10 @@ async fn handle_client(
             status.canonical_reason().unwrap_or("OK")
         );
         let mut response_header = format!(
-            "{}\r\nContent-Type: {}\r\nConnection: close\r\nCache-Control: no-cache",
-            status_line, content_type
+            "{}\r\nContent-Type: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: {}",
+            status_line,
+            content_type,
+            cors_allow_origin(origin.as_deref())
         );
         for name in ["content-range", "accept-ranges", "content-length"] {
             if let Some(v) = audio_resp.headers().get(name) {
@@ -392,8 +405,18 @@ async fn handle_client(
     *current_track.lock().await = None;
 
     if let Err(e) = &result {
-        eprintln!("[kebabify] Stream for track {} failed: {:#}", tid, e);
-        write_stream_error(&mut write_half, response_started).await?;
+        // JSON reason (bounded) + CORS: the extension diagnoses 502s via
+        // fetch, which needs ACAO to read the body at all. A Cloudflare 403
+        // from lucida means "run kebabify import-cookies" — say so.
+        let reason: String = format!("{:#}", e).chars().take(240).collect();
+        eprintln!("[kebabify] Stream for track {} failed: {}", tid, reason);
+        write_stream_error(
+            &mut write_half,
+            response_started,
+            origin.as_deref(),
+            &reason,
+        )
+        .await?;
     }
 
     result
@@ -402,17 +425,77 @@ async fn handle_client(
 async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     response_started: bool,
+    origin: Option<&str>,
+    reason: &str,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     if response_started {
         return Ok(());
     }
-    writer
-        .write_all(
-            b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nConnection: close\r\n\r\nProxy stream error",
-        )
-        .await?;
+    let hint = if reason.contains("403") || reason.contains("Cloudflare") {
+        "lucida.to is behind Cloudflare — run `kebabify import-cookies`"
+    } else if reason.contains("timed out") {
+        "lucida.to took too long — retry, or check your connection"
+    } else {
+        "proxy stream error"
+    };
+    let body = stream_error_body(hint, reason);
+    let resp = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\n\r\n{}",
+        body.len(),
+        cors_allow_origin(origin),
+        body
+    );
+    writer.write_all(resp.as_bytes()).await?;
     writer.flush().await?;
+    Ok(())
+}
+
+/// Builds the 502 JSON body. Pure for tests.
+fn stream_error_body(hint: &str, reason: &str) -> String {
+    serde_json::json!({"status": "error", "hint": hint, "reason": reason}).to_string()
+}
+
+/// Writes a `400 Bad Request` JSON response for unparseable track requests,
+/// then flushes. (Previously the connection just dropped — clients hung.)
+async fn write_bad_request<W: tokio::io::AsyncWrite + Unpin>(
+    write_half: &mut W,
+    origin: Option<&str>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let body =
+        serde_json::json!({"status": "error", "hint": "missing or invalid track id"}).to_string();
+    let resp = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\n\r\n{}",
+        body.len(),
+        cors_allow_origin(origin),
+        body
+    );
+    write_half.write_all(resp.as_bytes()).await?;
+    write_half.flush().await?;
+    Ok(())
+}
+
+/// Value for `Access-Control-Allow-Origin`: echo the caller, or `*` for
+/// non-browser clients that send no Origin (curl, media elements).
+fn cors_allow_origin(origin: Option<&str>) -> &str {
+    origin.unwrap_or("*")
+}
+
+/// Answers a CORS preflight for any path: the Spotify client fetches audio
+/// cross-origin (https xpui → http loopback), so OPTIONS must succeed or the
+/// real request never leaves the browser.
+async fn write_preflight<W: tokio::io::AsyncWrite + Unpin>(
+    write_half: &mut W,
+    origin: Option<&str>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let resp = format!(
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Range, Origin, Content-Type\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        cors_allow_origin(origin)
+    );
+    write_half.write_all(resp.as_bytes()).await?;
+    write_half.flush().await?;
     Ok(())
 }
 
@@ -548,13 +631,41 @@ mod tests {
     const TRACK_ID: &str = "4uLU6hMCjMI75M1A2tKUQC";
 
     #[tokio::test]
-    async fn stream_error_before_response_sends_bad_gateway() {
+    async fn stream_error_before_response_sends_json_with_cors() {
         let mut output = Vec::new();
-        write_stream_error(&mut output, false).await.unwrap();
-        assert_eq!(
-            output,
-            b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nConnection: close\r\n\r\nProxy stream error"
-        );
+        write_stream_error(
+            &mut output,
+            false,
+            Some("https://xpui.app.spotify.com"),
+            "lucida returned HTTP 403",
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(text.contains("Content-Type: application/json\r\n"));
+        assert!(text.contains("Access-Control-Allow-Origin: https://xpui.app.spotify.com\r\n"));
+        assert!(text.contains("import-cookies"));
+        // Content-Length matches the body.
+        let body = text.split("\r\n\r\n").nth(1).unwrap();
+        let len: usize = text
+            .lines()
+            .find(|l| l.starts_with("Content-Length:"))
+            .unwrap()["Content-Length:".len()..]
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(len, body.len());
+    }
+
+    #[tokio::test]
+    async fn stream_error_without_origin_allows_star() {
+        let mut output = Vec::new();
+        write_stream_error(&mut output, false, None, "boom")
+            .await
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("Access-Control-Allow-Origin: *\r\n"));
     }
 
     #[tokio::test]
@@ -564,9 +675,36 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfLaC".as_slice(),
         ] {
             let mut output = prefix.to_vec();
-            write_stream_error(&mut output, true).await.unwrap();
+            write_stream_error(&mut output, true, None, "boom")
+                .await
+                .unwrap();
             assert_eq!(output, prefix);
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_answers_no_content_with_cors() {
+        let mut output = Vec::new();
+        write_preflight(&mut output, Some("https://open.spotify.com"))
+            .await
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(text.contains("Access-Control-Allow-Origin: https://open.spotify.com\r\n"));
+        assert!(text.contains("Access-Control-Allow-Methods: GET, OPTIONS\r\n"));
+        assert!(text.contains("Range"));
+    }
+
+    #[tokio::test]
+    async fn bad_request_answers_400_with_cors() {
+        let mut output = Vec::new();
+        write_bad_request(&mut output, Some("https://open.spotify.com"))
+            .await
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(text.contains("Access-Control-Allow-Origin: https://open.spotify.com\r\n"));
+        assert!(text.contains("invalid track id"));
     }
 
     #[test]
