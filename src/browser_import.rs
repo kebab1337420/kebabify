@@ -199,14 +199,22 @@ async fn wait_for_page(port: u16) -> Option<String> {
         {
             if let Ok(targets) = resp.json::<Value>().await {
                 if let Some(list) = targets.as_array() {
-                    for t in list {
-                        let is_page = t.get("type").and_then(Value::as_str) == Some("page");
-                        let url = t.get("url").and_then(Value::as_str).unwrap_or("");
-                        let is_lucida = url.contains("lucida.to") || url.is_empty();
-                        if is_page && is_lucida {
-                            if let Some(ws) = t.get("webSocketDebuggerUrl").and_then(Value::as_str)
-                            {
-                                return Some(ws.to_string());
+                    // Two passes: an exact lucida.to tab first, a blank/new tab
+                    // only as fallback. Grabbing the blank tab when the lucida
+                    // tab exists would still work (cookies are filtered by URL,
+                    // UA is browser-wide), but the exact tab is unambiguous.
+                    for pass_exact in [true, false] {
+                        for t in list {
+                            let is_page = t.get("type").and_then(Value::as_str) == Some("page");
+                            let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+                            let matches =
+                                url.contains("lucida.to") || (!pass_exact && url.is_empty());
+                            if is_page && matches {
+                                if let Some(ws) =
+                                    t.get("webSocketDebuggerUrl").and_then(Value::as_str)
+                                {
+                                    return Some(ws.to_string());
+                                }
                             }
                         }
                     }
