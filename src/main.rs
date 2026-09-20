@@ -117,6 +117,13 @@ async fn main() -> Result<()> {
                 } else {
                     println!("Audio proxy:           stopped");
                 }
+                // Cookie state decides whether FLAC can work at all — surface
+                // it here so `status` answers "why no FLAC?" directly.
+                if lucida::has_session() {
+                    println!("Cookies stored:        yes");
+                } else {
+                    println!("Cookies stored:        no — run `kebabify import-cookies`");
+                }
             }
             Err(e) => {
                 println!("Spotify not found: {}", e);

@@ -41,8 +41,19 @@
 
     // ===== Proxy Health Check =====
     function checkProxyHealth() {
-        fetch(PROXY_BASE + 'health')
+        // Bound the probe: a hung (not dead) proxy must not pile up
+        // unresolved health checks every 3 s.
+        var controller = null;
+        var timer = null;
+        try {
+            if (typeof AbortController !== 'undefined') {
+                controller = new AbortController();
+                timer = setTimeout(function() { try { controller.abort(); } catch(e) {} }, 5000);
+            }
+        } catch(e) { controller = null; timer = null; }
+        fetch(PROXY_BASE + 'health', controller ? { signal: controller.signal } : undefined)
             .then(function(resp) {
+                if (timer) { clearTimeout(timer); timer = null; }
                 var alive = resp.ok;
                 var healthy = alive;
                 resp.json().then(function(data) {
@@ -53,6 +64,7 @@
                 });
             })
             .catch(function() {
+                if (timer) { clearTimeout(timer); timer = null; }
                 // CSP or network error — never assume a leftover proxified src
                 // proves the proxy is alive. Honest "down" beats a green lie.
                 applyProxyHealth(false);

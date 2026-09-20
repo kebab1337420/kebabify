@@ -74,7 +74,7 @@ impl Cdp {
 pub async fn import_from_browser() -> Result<()> {
     let browser = find_browser().context("No Chrome or Edge installation found")?;
     let port = free_port().context("Could not reserve a debug port")?;
-    let profile = temp_profile_dir();
+    let profile = temp_profile_dir()?;
     println!(
         "Opening a fresh Chrome window on lucida.to (port {} for cookies)...",
         port
@@ -128,9 +128,10 @@ async fn collect(cdp: &mut Cdp) -> Result<(String, String)> {
     while std::time::Instant::now() < deadline {
         let resp = cdp.call("Network.getCookies", urls.clone()).await?;
         let cookies = response_cookies(&resp)?;
-        // response_cookies only keeps Cloudflare names, so any hit means the
-        // challenge cookies exist (cf_clearance when solved, __cf_bm interim).
-        if !cookies.is_empty() {
+        // Require cf_clearance specifically: __cf_bm/__cfruid alone show up
+        // mid-challenge and are NOT enough for the lucida API — returning
+        // early on them fakes a success that still 403s every track.
+        if cookies.iter().any(|c| c.0 == "cf_clearance") {
             let header = cookies
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
@@ -290,7 +291,7 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn temp_profile_dir() -> PathBuf {
+fn temp_profile_dir() -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!(
         "kebabify-cdp-{}-{}",
         std::process::id(),
@@ -299,8 +300,9 @@ fn temp_profile_dir() -> PathBuf {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create temp profile at {}", dir.display()))?;
+    Ok(dir)
 }
 
 fn launch_browser(browser: &Path, port: u16, profile: &Path) -> std::io::Result<Child> {
