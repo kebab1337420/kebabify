@@ -166,6 +166,7 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
     let json: serde_json::Value = client
         .get(&url)
         .timeout(REQUEST_TIMEOUT)
+        .header("User-Agent", super::lucida::STOCK_UA)
         .send()
         .await
         .context("Saavn search request failed")?
@@ -291,6 +292,7 @@ async fn details_media_url(client: &reqwest::Client, token: &str) -> Result<Stri
     let json: serde_json::Value = client
         .get(&url)
         .timeout(REQUEST_TIMEOUT)
+        .header("User-Agent", super::lucida::STOCK_UA)
         .send()
         .await
         .context("Saavn details request failed")?
