@@ -47,7 +47,7 @@ impl Cdp {
         self.next_id += 1;
         let payload = json!({ "id": id, "method": method, "params": params });
         self.ws
-            .send(Message::Text(payload.to_string()))
+            .send(Message::Text(payload.to_string().into()))
             .await
             .context("CDP send failed")?;
         loop {

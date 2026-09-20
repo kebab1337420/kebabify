@@ -24,7 +24,9 @@ impl Cdp {
         let id = self.next_id;
         self.next_id += 1;
         let payload = json!({"id": id, "method": method, "params": params});
-        self.ws.send(Message::Text(payload.to_string())).await?;
+        self.ws
+            .send(Message::Text(payload.to_string().into()))
+            .await?;
         loop {
             // Same bound as the real importer: a frozen renderer must not
             // hang the capture past any outer deadline.
