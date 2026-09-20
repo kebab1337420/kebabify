@@ -26,7 +26,12 @@ impl Cdp {
         let payload = json!({"id": id, "method": method, "params": params});
         self.ws.send(Message::Text(payload.to_string())).await?;
         loop {
-            match self.ws.next().await {
+            // Same bound as the real importer: a frozen renderer must not
+            // hang the capture past any outer deadline.
+            let next = tokio::time::timeout(Duration::from_secs(10), self.ws.next())
+                .await
+                .map_err(|_| anyhow!("Timed out waiting for Chrome DevTools response"))?;
+            match next {
                 Some(Ok(Message::Text(txt))) => {
                     let v: Value = serde_json::from_str(&txt)?;
                     if v.get("id").and_then(Value::as_u64) == Some(id) {
