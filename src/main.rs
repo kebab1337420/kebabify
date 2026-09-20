@@ -22,6 +22,7 @@ mod audio_proxy;
 mod browser_import;
 mod lucida;
 mod patcher;
+mod saavn;
 
 #[derive(Parser)]
 #[command(name = "kebabify", version, about)]
@@ -225,7 +226,7 @@ async fn main() -> Result<()> {
                     // of letting the user discover it track by track.
                     if !lucida::has_session() {
                         println!(
-                            "NOTE: no lucida.to cookies stored — FLAC playback will fail until you run `kebabify import-cookies`."
+                            "NOTE: no lucida.to cookies stored — FLAC unavailable until you run `kebabify import-cookies` (Saavn 320kbps fallback still works)."
                         );
                     }
 
