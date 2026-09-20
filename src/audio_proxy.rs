@@ -29,6 +29,8 @@ pub struct AudioProxy {
     port: u16,
     /// Currently playing track ID (for the /health endpoint).
     current_track: Arc<Mutex<Option<String>>>,
+    /// Which upstream serves it: "lucida" (FLAC) or "saavn" (320kbps).
+    current_source: Arc<Mutex<Option<&'static str>>>,
     /// Signals the accept loop to terminate (graceful shutdown).
     shutdown: Arc<Notify>,
     /// Latched shutdown flag — closes the Notify race window.
@@ -52,6 +54,7 @@ impl AudioProxy {
         Self {
             port,
             current_track: Arc::new(Mutex::new(None)),
+            current_source: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             client,
@@ -96,6 +99,7 @@ impl AudioProxy {
             };
 
             let current_track = self.current_track.clone();
+            let current_source = self.current_source.clone();
             let shutting_down = self.shutting_down.clone();
             let shutdown = self.shutdown.clone();
             let client = self.client.clone();
@@ -107,8 +111,15 @@ impl AudioProxy {
                 let Ok(_permit) = semaphore.acquire().await else {
                     return;
                 };
-                if let Err(e) =
-                    handle_client(socket, current_track, shutting_down, shutdown, client).await
+                if let Err(e) = handle_client(
+                    socket,
+                    current_track,
+                    current_source,
+                    shutting_down,
+                    shutdown,
+                    client,
+                )
+                .await
                 {
                     eprintln!("[kebabify] Proxy error: {}", e);
                 }
@@ -159,6 +170,7 @@ impl AudioProxy {
 async fn handle_client(
     stream: tokio::net::TcpStream,
     current_track: Arc<Mutex<Option<String>>>,
+    current_source: Arc<Mutex<Option<&'static str>>>,
     shutting_down: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     client: reqwest::Client,
@@ -231,7 +243,14 @@ async fn handle_client(
         // Built with serde_json rather than format!: track IDs are validated
         // alphanumerics today, but manual quoting would silently break on the
         // first value that ever needs escaping.
-        let body = serde_json::json!({"status": "ok", "track": track, "flac": true}).to_string();
+        let source = (*current_source.lock().await).unwrap_or("none");
+        let body = serde_json::json!({
+            "status": "ok",
+            "track": track,
+            "flac": source == "lucida",
+            "source": source,
+        })
+        .to_string();
 
         let mut resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -313,7 +332,7 @@ async fn handle_client(
     };
 
     *current_track.lock().await = Some(tid.clone());
-    println!("[kebabify] Track ID: {} — fetching FLAC via lucida.to", tid);
+    println!("[kebabify] Track ID: {} — resolving upstream", tid);
 
     let spotify_url = format!("https://open.spotify.com/track/{}", tid);
 
@@ -322,24 +341,46 @@ async fn handle_client(
     // byte-range seeking; when it doesn't (200 full body) behavior is unchanged.
     let range_header = request_range(&header_block);
 
-    // Resolve and stream from lucida.to inside a block: whatever happens, the
-    // indicator is reset afterwards so /health never reports a ghost track.
+    // Resolve and stream inside a block: whatever happens, the indicator is
+    // reset afterwards so /health never reports a ghost track.
     let mut response_started = false;
     let result: Result<()> = async {
-        let lucida_stream =
-            crate::lucida::open_stream(&client, &spotify_url, range_header.as_deref()).await?;
-        let mut audio_resp = lucida_stream.response;
+        // Primary: lucida FLAC. Fallback: Saavn 320kbps — a track playing in
+        // high quality beats a 502.
+        let (mut audio_resp, is_flac, source): (reqwest::Response, bool, &'static str) =
+            match crate::lucida::open_stream(&client, &spotify_url, range_header.as_deref()).await
+            {
+                Ok(s) => (s.response, true, "lucida"),
+                Err(lucida_err) => {
+                    eprintln!(
+                        "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
+                        tid, lucida_err
+                    );
+                    match crate::saavn::open_stream(&client, &tid, range_header.as_deref()).await {
+                        Ok(s) => (s.response, false, "saavn"),
+                        Err(saavn_err) => {
+                            return Err(anyhow!(
+                                "lucida: {:#}; saavn: {:#}",
+                                lucida_err,
+                                saavn_err
+                            ));
+                        }
+                    }
+                }
+            };
+        *current_source.lock().await = Some(source);
 
+        let default_type = if is_flac { "audio/flac" } else { "audio/mp4" };
         let content_type = audio_resp
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("audio/flac")
+            .unwrap_or(default_type)
             .to_string();
 
         if !content_type.contains("flac") && !content_type.contains("audio") {
             eprintln!(
-                "[kebabify] WARNING: content-type is not FLAC: {}",
+                "[kebabify] WARNING: content-type is not audio: {}",
                 content_type
             );
         }
@@ -393,16 +434,19 @@ async fn handle_client(
 
         write_half.flush().await?;
         println!(
-            "[kebabify] Served FLAC for track {} ({} bytes)",
-            tid, total_bytes
+            "[kebabify] Served {} for track {} ({} bytes)",
+            if is_flac { "FLAC" } else { "AAC-320 (saavn fallback)" },
+            tid,
+            total_bytes
         );
 
         Ok(())
     }
     .await;
 
-    // Track finished (or failed) — drop the indicator so /health reports null.
+    // Track finished (or failed) — drop the indicators so /health reports null.
     *current_track.lock().await = None;
+    *current_source.lock().await = None;
 
     if let Err(e) = &result {
         // JSON reason (bounded) + CORS: the extension diagnoses 502s via
@@ -433,9 +477,11 @@ async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
         return Ok(());
     }
     let hint = if reason.contains("403") || reason.contains("Cloudflare") {
-        "lucida.to is behind Cloudflare — run `kebabify import-cookies`"
+        "lucida.to is behind Cloudflare — run `kebabify import-cookies` for FLAC (Saavn fallback also failed)"
+    } else if reason.contains("no good match") {
+        "Saavn fallback found no reliable 320kbps match — track may be missing or mislabeled there"
     } else if reason.contains("timed out") {
-        "lucida.to took too long — retry, or check your connection"
+        "upstreams took too long — retry, or check your connection"
     } else {
         "proxy stream error"
     };

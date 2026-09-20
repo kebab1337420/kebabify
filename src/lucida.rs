@@ -131,7 +131,7 @@ fn identify(
     req: reqwest::RequestBuilder,
     session: Option<&CloudflareSession>,
 ) -> reqwest::RequestBuilder {
-    let ua = session.map(|s| s.user_agent.as_str()).unwrap_or(USER_AGENT);
+    let ua = session.map(|s| s.user_agent.as_str()).unwrap_or(STOCK_UA);
     let req = req
         .header("User-Agent", ua)
         .header(
@@ -317,8 +317,9 @@ pub async fn open_stream(
     })
 }
 
-/// User agent used for all lucida requests.
-const USER_AGENT: &str =
+/// Stock User-Agent for requests that carry no captured browser session.
+/// Shared with the Saavn fallback, which is sessionless by design.
+pub const STOCK_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 /// Extracts the CSRF token from the lucida HTML page.
