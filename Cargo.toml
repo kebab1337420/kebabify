@@ -1,6 +1,6 @@
 [package]
 name = "kebabify"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Alaric <alaric@kebaccify.dev>"]
 description = "Spicetify-like extension for Spotify: ad-free, lossless audio via lucida.to API with JioSaavn fallback"
