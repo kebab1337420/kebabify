@@ -26,7 +26,7 @@ kebabify.exe import-cookies            # opens Chrome on lucida.to — solve the
 kebabify.exe cookie "<user-agent>" "cf_clearance=...; __cf_bm=..."   # manual paste (alias: cookies)
 ```
 
-Cookies are stored under `%APPDATA%\Kebabify\cookies.txt` and replayed on every lucida request. Override path with `KEBABIFY_COOKIES_PATH`.
+Cookies are stored under `%APPDATA%\Kebabify\cookies.txt` and replayed on every lucida request. Override path with `KEBABIFY_COOKIES_PATH`. Note: that file holds live Cloudflare session cookies in plaintext — same exposure class as browser cookie jars, so don't share or commit it.
 
 While Spotify plays, the extension redirects audio requests to a local proxy on `http://127.0.0.1:18900` (loopback only), which streams FLAC back to the player. The `KB` badge in the playbar shows the state (green = FLAC verified, amber = proxy down, grey = FLAC off — click to toggle).
 

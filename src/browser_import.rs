@@ -128,7 +128,9 @@ async fn collect(cdp: &mut Cdp) -> Result<(String, String)> {
     while std::time::Instant::now() < deadline {
         let resp = cdp.call("Network.getCookies", urls.clone()).await?;
         let cookies = response_cookies(&resp)?;
-        if cookies.iter().any(|c| c.0 == "cf_clearance") || !cookies.is_empty() {
+        // response_cookies only keeps Cloudflare names, so any hit means the
+        // challenge cookies exist (cf_clearance when solved, __cf_bm interim).
+        if !cookies.is_empty() {
             let header = cookies
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
