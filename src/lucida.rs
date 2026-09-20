@@ -353,22 +353,47 @@ fn extract_token_expiry(html: &str) -> Option<u64> {
     None
 }
 
-/// Lightweight URL encoder.
+/// Percent-encoding for the lucida resolve URL: the full Spotify track URL
+/// rides as a single path segment, so everything outside RFC 3986 unreserved
+/// (`A-Z a-z 0-9 - _ . ~`) is escaped. Backed by the audited
+/// `percent-encoding` crate instead of a hand-rolled byte loop.
 pub mod urlencoding {
+    use percent_encoding::{AsciiSet, CONTROLS};
+
+    /// Everything except unreserved chars must be escaped.
+    const SEGMENT: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'!')
+        .add(b'"')
+        .add(b'#')
+        .add(b'$')
+        .add(b'%')
+        .add(b'&')
+        .add(b'\'')
+        .add(b'(')
+        .add(b')')
+        .add(b'*')
+        .add(b'+')
+        .add(b',')
+        .add(b'/')
+        .add(b':')
+        .add(b';')
+        .add(b'<')
+        .add(b'=')
+        .add(b'>')
+        .add(b'?')
+        .add(b'@')
+        .add(b'[')
+        .add(b'\\')
+        .add(b']')
+        .add(b'^')
+        .add(b'`')
+        .add(b'{')
+        .add(b'|')
+        .add(b'}');
+
     pub fn encode(s: &str) -> String {
-        let mut result = String::with_capacity(s.len() * 3);
-        for byte in s.bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    result.push(byte as char);
-                }
-                _ => {
-                    result.push('%');
-                    result.push_str(&format!("{:02X}", byte));
-                }
-            }
-        }
-        result
+        percent_encoding::utf8_percent_encode(s, SEGMENT).to_string()
     }
 }
 
@@ -420,6 +445,11 @@ mod tests {
     fn url_encode_reserved_chars() {
         assert_eq!(urlencoding::encode("a b&c=/x"), "a%20b%26c%3D%2Fx");
         assert_eq!(urlencoding::encode("A-Z_0.9~"), "A-Z_0.9~");
+        assert_eq!(urlencoding::encode("caf\u{e9}"), "caf%C3%A9");
+        assert_eq!(
+            urlencoding::encode("https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl"),
+            "https%3A%2F%2Fopen.spotify.com%2Ftrack%2F11dFghVXANMlKmJXsNCbNl"
+        );
     }
 
     #[test]

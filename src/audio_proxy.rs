@@ -59,7 +59,8 @@ impl AudioProxy {
         }
     }
 
-    /// Starts the proxy server. Runs until a `/shutdown` request arrives.
+    /// Starts the proxy server. Runs until a `/shutdown` request arrives
+    /// or Ctrl+C is pressed (graceful stop for foreground runs).
     pub async fn start(&self) -> Result<()> {
         let listener = tokio::net::TcpListener::bind((PROXY_HOST, self.port))
             .await
@@ -80,6 +81,10 @@ impl AudioProxy {
 
             let (socket, _) = match tokio::select! {
                 _ = self.shutdown.notified() => break,
+                _ = tokio::signal::ctrl_c() => {
+                    self.shutting_down.store(true, Ordering::Relaxed);
+                    break;
+                }
                 accepted = listener.accept() => accepted,
             } {
                 Ok(conn) => conn,
@@ -215,11 +220,10 @@ async fn handle_client(
         }
 
         let track = current_track.lock().await.clone();
-        let track_json = track
-            .as_deref()
-            .map(|t| format!("\"{}\"", t))
-            .unwrap_or_else(|| "null".to_string());
-        let body = format!(r#"{{"status":"ok","track":{},"flac":true}}"#, track_json);
+        // Built with serde_json rather than format!: track IDs are validated
+        // alphanumerics today, but manual quoting would silently break on the
+        // first value that ever needs escaping.
+        let body = serde_json::json!({"status": "ok", "track": track, "flac": true}).to_string();
 
         let mut resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -255,7 +259,7 @@ async fn handle_client(
         // Set the latched flag BEFORE waking the accept loop: even if the
         // notifier is missed, the loop-top check breaks on the next iteration.
         shutting_down.store(true, Ordering::Relaxed);
-        let body = r#"{"status":"stopping"}"#;
+        let body = serde_json::json!({"status": "stopping"}).to_string();
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -415,7 +419,7 @@ async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
 /// Writes a minimal `403 Forbidden` JSON response, then flushes.
 async fn write_forbidden<W: tokio::io::AsyncWrite + Unpin>(write_half: &mut W) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let body = r#"{"status":"forbidden"}"#;
+    let body = serde_json::json!({"status": "forbidden"}).to_string();
     let resp = format!(
         "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -496,7 +500,15 @@ fn extract_track_id(url: &str) -> Option<String> {
     }
 
     // Manual fallback — look for track IDs near known keys.
-    for key in &["track/", "tracks/", "track=", "id=", "track_id="] {
+    // ("spotify:track:" is matched whole so "soundtrack:…" can't hit it.)
+    for key in &[
+        "spotify:track:",
+        "track/",
+        "tracks/",
+        "track=",
+        "id=",
+        "track_id=",
+    ] {
         let mut search_from = 0;
         while let Some(rel) = url[search_from..].find(key) {
             let start = search_from + rel + key.len();
@@ -608,6 +620,14 @@ mod tests {
         assert_eq!(
             extract_track_id("https://audio-spotify.com/track/1234567890abcdef1234567890abcdef"),
             None
+        );
+    }
+
+    #[test]
+    fn track_id_from_spotify_uri() {
+        assert_eq!(
+            extract_track_id(&format!("spotify:track:{}", TRACK_ID)),
+            Some(TRACK_ID.to_string())
         );
     }
 

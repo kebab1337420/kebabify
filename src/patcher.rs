@@ -449,10 +449,10 @@ fn find_spotify_install() -> Result<PathBuf> {
             }
         }
 
-        // Fallback: WindowsApps
-        let winapps = PathBuf::from("C:\\Program Files\\WindowsApps\\SpotifyAB.Spotify");
-        if winapps.exists() && winapps.join("Apps").join("xpui").exists() {
-            return Ok(winapps);
+        // Fallback: Microsoft Store installs live under versioned dirs that a
+        // hardcoded path can never match — scan by package-name prefix.
+        if let Some(dir) = find_store_install() {
+            return Ok(dir);
         }
 
         if let Ok(exe) = which::which("spotify") {
@@ -495,6 +495,36 @@ fn find_spotify_install() -> Result<PathBuf> {
     {
         Err(anyhow!("Unsupported platform"))
     }
+}
+
+/// Picks the Spotify package dir out of `WindowsApps` entry names. Store
+/// dirs are versioned (`SpotifyAB.SpotifyMusic_1.2_…`), so the package prefix
+/// is matched rather than a fixed path.
+fn store_package_dir(entries: &[String]) -> Option<PathBuf> {
+    const WINDOWSAPPS: &str = "C:\\Program Files\\WindowsApps";
+    entries
+        .iter()
+        .find(|e| e.starts_with("SpotifyAB.Spotify"))
+        .map(|e| PathBuf::from(WINDOWSAPPS).join(e))
+}
+
+/// Scans `C:\Program Files\WindowsApps` for a Spotify Store package.
+/// Returns `None` when the dir is unreadable (access-denied for non-admins)
+/// or holds no Spotify package — callers fall through to the next strategy.
+#[cfg(target_os = "windows")]
+fn find_store_install() -> Option<PathBuf> {
+    let entries = std::fs::read_dir("C:\\Program Files\\WindowsApps")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let dir = store_package_dir(&entries)?;
+    dir.join("Apps").join("xpui").exists().then_some(dir)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_store_install() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]
@@ -597,5 +627,21 @@ mod tests {
             cfg,
             PathBuf::from("C:\\Users\\u\\AppData\\Roaming\\spicetify\\config-xpui.ini")
         );
+    }
+
+    #[test]
+    fn store_scan_matches_versioned_package_only() {
+        let entries = vec![
+            "Microsoft.WindowsStore_8wekyb3d8bbwe".to_string(),
+            "SpotifyAB.SpotifyMusic_1.2.3_x64__zpdnekdrzrea0".to_string(),
+        ];
+        let dir = store_package_dir(&entries).unwrap();
+        assert!(
+            dir.ends_with("SpotifyAB.SpotifyMusic_1.2.3_x64__zpdnekdrzrea0"),
+            "unexpected dir: {}",
+            dir.display()
+        );
+        assert_eq!(store_package_dir(&entries[..1]), None);
+        assert_eq!(store_package_dir(&[]), None);
     }
 }
