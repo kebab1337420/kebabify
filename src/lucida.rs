@@ -152,6 +152,23 @@ pub fn has_session() -> bool {
     load_session().is_some()
 }
 
+/// Whether the stored session carries `cf_clearance` — the cookie that
+/// proves the challenge was actually solved. A session without it (e.g. a
+/// manual paste of only `__cf_bm`) still 403s on every track.
+pub fn has_cf_clearance() -> bool {
+    load_session()
+        .map(|s| cookie_has_clearance(&s.cookie))
+        .unwrap_or(false)
+}
+
+/// Checks a raw `Cookie` header value for the clearance cookie. Pure.
+pub fn cookie_has_clearance(cookie_header: &str) -> bool {
+    cookie_header.split(';').any(|pair| {
+        let name = pair.split('=').next().unwrap_or("").trim();
+        name.eq_ignore_ascii_case("cf_clearance")
+    })
+}
+
 /// The lucida API endpoint for requesting a track stream.
 pub const LUCIDA_API_LOAD: &str = "https://lucida.to/api/load?url=%2Fapi%2Ffetch%2Fstream%2Fv2";
 
@@ -466,6 +483,16 @@ mod tests {
             urlencoding::encode("https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl"),
             "https%3A%2F%2Fopen.spotify.com%2Ftrack%2F11dFghVXANMlKmJXsNCbNl"
         );
+    }
+
+    #[test]
+    fn clearance_cookie_detected() {
+        assert!(cookie_has_clearance("cf_clearance=abc; __cf_bm=def"));
+        assert!(cookie_has_clearance("__cf_bm=def; CF_CLEARANCE=abc"));
+        assert!(cookie_has_clearance("  cf_clearance =abc"));
+        assert!(!cookie_has_clearance("__cf_bm=def; __cfruid=xyz"));
+        assert!(!cookie_has_clearance(""));
+        assert!(!cookie_has_clearance("not_cf_clearance=abc"));
     }
 
     #[test]

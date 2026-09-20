@@ -120,10 +120,13 @@ async fn main() -> Result<()> {
                 }
                 // Cookie state decides whether FLAC can work at all — surface
                 // it here so `status` answers "why no FLAC?" directly.
-                if lucida::has_session() {
-                    println!("Cookies stored:        yes");
-                } else {
-                    println!("Cookies stored:        no — run `kebabify import-cookies`");
+                // A session without cf_clearance 403s just the same.
+                match (lucida::has_session(), lucida::has_cf_clearance()) {
+                    (false, _) => println!("Cookies stored:        no — run `kebabify import-cookies`"),
+                    (true, true) => println!("Cookies stored:        yes"),
+                    (true, false) => println!(
+                        "Cookies stored:        partial (no cf_clearance) — re-run `kebabify import-cookies`"
+                    ),
                 }
             }
             Err(e) => {
@@ -134,6 +137,13 @@ async fn main() -> Result<()> {
             lucida::save_cookies(&user_agent, &cookie)?;
             println!("kebabify — Cloudflare cookies stored.");
             println!("The audio proxy will now use them on all lucida.to requests.");
+            // A paste without cf_clearance "succeeds" but still 403s — say so
+            // now instead of letting every track fail silently.
+            if !lucida::cookie_has_clearance(&cookie) {
+                println!(
+                    "WARNING: no cf_clearance in there — the challenge was probably not solved; expect 403s until you re-run `kebabify import-cookies`."
+                );
+            }
         }
         Some(Commands::ImportCookies) => {
             println!("kebabify — opening Chrome to capture the lucida.to cookies...");
@@ -224,9 +234,9 @@ async fn main() -> Result<()> {
                     // Without stored Cloudflare cookies every track fails at the
                     // lucida handshake (HTTP 403 → proxy 502): warn now instead
                     // of letting the user discover it track by track.
-                    if !lucida::has_session() {
+                    if !lucida::has_cf_clearance() {
                         println!(
-                            "NOTE: no lucida.to cookies stored — FLAC unavailable until you run `kebabify import-cookies` (Saavn 320kbps fallback still works)."
+                            "NOTE: no usable lucida.to cookies stored — FLAC unavailable until you run `kebabify import-cookies` (Saavn 320kbps fallback still works)."
                         );
                     }
 

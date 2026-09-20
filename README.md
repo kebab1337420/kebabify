@@ -48,7 +48,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Troubleshooting
 
-- **403 / "Just a moment" from lucida** → re-run `kebabify.exe import-cookies` (Cloudflare cookies expire).
+- **403 / "Just a moment" from lucida** → re-run `kebabify.exe import-cookies` (Cloudflare cookies expire). `status` shows `partial` if the stored cookies lack `cf_clearance` — same fix.
 - **Proxy already running** → `apply` reuses the instance on port 18900 instead of spawning a duplicate.
 - **`spicetify apply` wiped the badge** → run `kebabify.exe update-ext`; kebabify registers its extension in Spicetify's config to survive applies.
 - **Spotify updated itself and kebabify is gone** → re-run `kebabify.exe apply`; pristine backups are kept, so re-patching is safe.
