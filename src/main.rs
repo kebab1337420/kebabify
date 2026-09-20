@@ -68,6 +68,24 @@ enum Commands {
     AudioProxyOnly,
 }
 
+/// Proxy + cookie state for `status` (and the no-Spotify branch): independent
+/// of the install, and the part that decides whether FLAC can work.
+async fn print_runtime_state() {
+    if audio_proxy::AudioProxy::is_running().await {
+        println!("Audio proxy:           running");
+    } else {
+        println!("Audio proxy:           stopped");
+    }
+    // A session without cf_clearance 403s just the same.
+    match (lucida::has_session(), lucida::has_cf_clearance()) {
+        (false, _) => println!("Cookies stored:        no — run `kebabify import-cookies`"),
+        (true, true) => println!("Cookies stored:        yes"),
+        (true, false) => println!(
+            "Cookies stored:        partial (no cf_clearance) — re-run `kebabify import-cookies`"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -113,24 +131,13 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => match patcher {
             Ok(p) => {
                 p.print_status()?;
-                if audio_proxy::AudioProxy::is_running().await {
-                    println!("Audio proxy:           running");
-                } else {
-                    println!("Audio proxy:           stopped");
-                }
-                // Cookie state decides whether FLAC can work at all — surface
-                // it here so `status` answers "why no FLAC?" directly.
-                // A session without cf_clearance 403s just the same.
-                match (lucida::has_session(), lucida::has_cf_clearance()) {
-                    (false, _) => println!("Cookies stored:        no — run `kebabify import-cookies`"),
-                    (true, true) => println!("Cookies stored:        yes"),
-                    (true, false) => println!(
-                        "Cookies stored:        partial (no cf_clearance) — re-run `kebabify import-cookies`"
-                    ),
-                }
+                print_runtime_state().await;
             }
             Err(e) => {
                 println!("Spotify not found: {}", e);
+                // The proxy and cookies live outside the Spotify install —
+                // report them anyway (e.g. proxy left running after uninstall).
+                print_runtime_state().await;
             }
         },
         Some(Commands::Cookie { user_agent, cookie }) => {
