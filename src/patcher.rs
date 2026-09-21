@@ -98,6 +98,12 @@ impl SpotifyPatcher {
 
         self.unsync_spicetify_extension()?;
 
+        // Clean reinstall support: drop the backup dirs after a successful
+        // restore so the next `apply` snapshots the *current* Spotify files
+        // instead of reusing potentially stale ones. No manual cleanup needed.
+        self.remove_backup_dirs()?;
+        eprintln!("  Removed: backup dirs");
+
         Ok(())
     }
 
@@ -158,6 +164,27 @@ impl SpotifyPatcher {
         } else {
             self.spotify_dir.join(".kebabify_backups")
         }
+    }
+
+    /// Every backup location, current name and legacy rename included, so
+    /// cleanup never leaves one behind.
+    fn backup_candidates(&self) -> [PathBuf; 2] {
+        [
+            self.spotify_dir.join(".kebabify_backups"),
+            self.spotify_dir.join(".kebaccify_backups"),
+        ]
+    }
+
+    /// Deletes every backup dir that exists. Runs at the end of a successful
+    /// uninstall so reinstalls start from a clean slate. Idempotent.
+    fn remove_backup_dirs(&self) -> Result<()> {
+        for dir in self.backup_candidates() {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("Failed to remove backup dir {}", dir.display()))?;
+            }
+        }
+        Ok(())
     }
 
     fn backup_files(&self) -> Result<()> {
@@ -643,5 +670,27 @@ mod tests {
         );
         assert_eq!(store_package_dir(&entries[..1]), None);
         assert_eq!(store_package_dir(&[]), None);
+    }
+
+    #[test]
+    fn uninstall_cleanup_removes_all_backup_dirs() {
+        let root =
+            std::env::temp_dir().join(format!("kebabify_uninstall_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let patcher = SpotifyPatcher {
+            spotify_dir: root.clone(),
+            xpui_dir: root.join("Apps").join("xpui"),
+        };
+        for dir in patcher.backup_candidates() {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("probe.txt"), "x").unwrap();
+        }
+        patcher.remove_backup_dirs().unwrap();
+        for dir in patcher.backup_candidates() {
+            assert!(!dir.exists(), "leftover {}", dir.display());
+        }
+        // Idempotent: a second run is a no-op.
+        patcher.remove_backup_dirs().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

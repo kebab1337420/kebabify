@@ -164,6 +164,27 @@ impl AudioProxy {
             Err(_) => false,
         }
     }
+
+    /// Waits up to `timeout` for the proxy to answer `/health` at all
+    /// (readiness after spawn — any status counts, the port is bound).
+    pub async fn wait_until_ready(timeout: Duration) -> bool {
+        let url = format!("http://{}:{}/health", PROXY_HOST, PROXY_PORT);
+        let client = reqwest::Client::new();
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if client
+                .get(&url)
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        false
+    }
 }
 
 /// Handles a single HTTP request to the proxy.
