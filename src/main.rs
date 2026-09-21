@@ -86,6 +86,38 @@ async fn print_runtime_state() {
     }
 }
 
+/// stdio for the detached proxy: append to a log file next to the cookies
+/// instead of the void. Without this, panics and errors in the detached
+/// process vanish without a trace.
+fn proxy_stdio() -> (Stdio, Stdio) {
+    let fallback = || (Stdio::null(), Stdio::null());
+    let Some(dir) = lucida::cookies_file_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+    else {
+        return fallback();
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("proxy.log");
+    // Cheap rotation: start fresh past 2 MB.
+    if let Ok(m) = std::fs::metadata(&path) {
+        if m.len() > 2 * 1024 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => match f.try_clone() {
+            Ok(out) => (Stdio::from(out), Stdio::from(f)),
+            Err(_) => fallback(),
+        },
+        Err(_) => fallback(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -188,9 +220,10 @@ async fn main() -> Result<()> {
                         let exe =
                             std::env::current_exe().context("Cannot find kebabify.exe path")?;
                         let mut cmd = std::process::Command::new(&exe);
+                        let (child_out, child_err) = proxy_stdio();
                         cmd.arg("audio-proxy-only")
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
+                            .stdout(child_out)
+                            .stderr(child_err);
                         #[cfg(target_os = "windows")]
                         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — no console window
                         let _child = cmd.spawn().context("Failed to start audio proxy process")?;

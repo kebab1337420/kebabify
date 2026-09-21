@@ -55,12 +55,16 @@ static CDN_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Cached CDN URL when fresh, else `None`. Pure-ish (clock) — tested via
-/// [`cache_is_fresh`].
+/// Cached CDN URL when fresh, else `None`. Stale entries are evicted on
+/// read so the map can't fill with dead weight over a long-running proxy.
 fn cached_cdn_url(track_id: &str) -> Option<String> {
-    let guard = CDN_CACHE.lock().ok()?;
+    let mut guard = CDN_CACHE.lock().ok()?;
     let (url, at) = guard.get(track_id)?;
-    cache_is_fresh(*at).then(|| url.clone())
+    if !cache_is_fresh(*at) {
+        guard.remove(track_id);
+        return None;
+    }
+    Some(url.clone())
 }
 
 fn cache_is_fresh(at: std::time::Instant) -> bool {
@@ -69,6 +73,12 @@ fn cache_is_fresh(at: std::time::Instant) -> bool {
 
 fn store_cdn_url(track_id: &str, url: String) {
     if let Ok(mut guard) = CDN_CACHE.lock() {
+        // Sweep expired, then hard-cap: unbounded growth over weeks of
+        // distinct tracks is a slow leak for a daemon-shaped proxy.
+        guard.retain(|_, (_, at)| cache_is_fresh(*at));
+        if guard.len() >= 512 {
+            guard.clear();
+        }
         guard.insert(track_id.to_string(), (url, std::time::Instant::now()));
     }
 }
@@ -118,7 +128,17 @@ pub async fn open_stream(
             )
         })?;
 
-    let cdn_url = details_media_url(client, &picked.token).await?;
+    // Search hits already carry `encrypted_media_url` (byte-identical to the
+    // details endpoint): decrypt straight away, keep `details` for hits
+    // that lack it or carry a corrupt one. Saves one HTTPS round-trip per
+    // uncached track.
+    let cdn_url = match picked.enc_url.as_deref() {
+        Some(enc) => match decrypt_media_url(enc) {
+            Ok(url) => url,
+            Err(_) => details_media_url(client, &picked.token).await?,
+        },
+        None => details_media_url(client, &picked.token).await?,
+    };
     store_cdn_url(track_id, cdn_url.clone());
     stream_cdn(client, &cdn_url, range, if_range).await
 }
@@ -143,15 +163,6 @@ async fn stream_cdn(
         return Err(anyhow!("Saavn: CDN returned HTTP {}", resp.status()));
     }
     Ok(SaavnStream { response: resp })
-}
-
-/// Raw Saavn search hit used for scoring.
-struct Candidate {
-    token: String,
-    title: String,
-    artists: Vec<String>,
-    duration_s: u64,
-    has_320: bool,
 }
 
 /// Fetches title/artist/duration from the public Spotify embed page.
@@ -229,6 +240,23 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
         .await
         .context("Failed to parse Saavn search response")?;
 
+    Ok(parse_search_candidates(&json))
+}
+
+/// Raw Saavn search hit used for scoring.
+struct Candidate {
+    token: String,
+    title: String,
+    artists: Vec<String>,
+    duration_s: u64,
+    has_320: bool,
+    /// `encrypted_media_url` straight from the search hit: byte-identical to
+    /// what `webapi.get` returns, so `details` is only a fallback. Pure parse.
+    enc_url: Option<String>,
+}
+
+/// Parses `search.getResults` hits. Pure for tests.
+fn parse_search_candidates(json: &serde_json::Value) -> Vec<Candidate> {
     let mut out = Vec::new();
     let empty = Vec::new();
     for item in json
@@ -240,11 +268,11 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
         let token = item
             .get("perma_url")
             .and_then(|v| v.as_str())
-            // Tokens ride as the last path segment: trim a trailing slash
-            // and drop ?query/#fragment so `details` gets a clean token.
+            // Tokens ride as the last path segment: drop ?query/#fragment
+            // first, then a trailing slash, so `details` gets a clean token.
+            .and_then(|u| u.split(['?', '#']).next())
             .map(|u| u.trim_end_matches('/'))
             .and_then(|u| u.rsplit('/').next())
-            .and_then(|s| s.split(['?', '#']).next())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         let Some(token) = token else { continue };
@@ -273,9 +301,14 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
                 .map(parse_saavn_duration)
                 .unwrap_or(0),
             has_320: more.and_then(|m| m.get("320kbps")).and_then(|v| v.as_str()) == Some("true"),
+            enc_url: more
+                .and_then(|m| m.get("encrypted_media_url"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         });
     }
-    Ok(out)
+    out
 }
 
 /// Scores a Saavn hit against the Spotify metadata. Pure for tests.
@@ -457,6 +490,7 @@ mod tests {
             artists: artists.iter().map(|s| s.to_string()).collect(),
             duration_s,
             has_320: true,
+            enc_url: None,
         }
     }
 
@@ -558,5 +592,51 @@ mod tests {
     #[test]
     fn embed_meta_missing_is_none() {
         assert!(parse_embed_meta("<html></html>").is_none());
+    }
+
+    #[test]
+    fn search_hits_parsed_with_tokens_and_media_urls() {
+        // Shape live-captured from search.getResults (trimmed).
+        let json = serde_json::json!({
+            "total": 2,
+            "results": [
+                {
+                    "id": "Xv4rC9HK",
+                    "title": "Some Song",
+                    "perma_url": "https://www.jiosaavn.com/song/some-song/ABC123xyz",
+                    "more_info": {
+                        "duration": "206",
+                        "320kbps": "true",
+                        "encrypted_media_url": "aGVsbG8td29ybGQ=",
+                        "artistMap": {"primary_artists": [{"name": "Some Artist"}]},
+                    },
+                },
+                {
+                    "id": "deadbeef",
+                    "title": "Trailing Slash",
+                    "perma_url": "https://www.jiosaavn.com/song/trailing-slash/TOK456/?autoplay=1",
+                    "more_info": {
+                        "duration": 208,
+                        "artistMap": {"primary_artists": [{"name": "Other"}]},
+                    },
+                },
+                {
+                    "id": "nope",
+                    "title": "No Perma",
+                    "more_info": {"duration": "200"},
+                },
+            ],
+        });
+        let out = parse_search_candidates(&json);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].token, "ABC123xyz");
+        assert_eq!(out[0].duration_s, 206);
+        assert!(out[0].has_320);
+        assert_eq!(out[0].enc_url.as_deref(), Some("aGVsbG8td29ybGQ="));
+        assert_eq!(out[0].artists, vec!["Some Artist".to_string()]);
+        assert_eq!(out[1].token, "TOK456");
+        assert_eq!(out[1].duration_s, 208);
+        assert!(!out[1].has_320);
+        assert_eq!(out[1].enc_url, None);
     }
 }
