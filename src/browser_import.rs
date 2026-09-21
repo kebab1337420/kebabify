@@ -328,3 +328,53 @@ fn launch_browser(browser: &Path, port: u16, profile: &Path) -> std::io::Result<
         .stderr(Stdio::null())
         .spawn()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cdp_cookies(names: &[(&str, &str)]) -> Value {
+        json!({
+            "id": 1,
+            "result": {
+                "cookies": names
+                    .iter()
+                    .map(|(n, v)| json!({"name": n, "value": v}))
+                    .collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    #[test]
+    fn keeps_only_cloudflare_cookies() {
+        let resp = cdp_cookies(&[
+            ("cf_clearance", "abc"),
+            ("sessionid", "drop-me"),
+            ("__cf_bm", "def"),
+            ("__cfruid", "ghi"),
+            ("tracking", "drop-me-too"),
+        ]);
+        let got = response_cookies(&resp).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("cf_clearance".to_string(), "abc".to_string()),
+                ("__cf_bm".to_string(), "def".to_string()),
+                ("__cfruid".to_string(), "ghi".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_cookie_list_is_ok() {
+        let got = response_cookies(&cdp_cookies(&[])).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn malformed_cdp_response_is_error() {
+        assert!(response_cookies(&json!({"id": 1})).is_err());
+        assert!(response_cookies(&json!({"result": {}})).is_err());
+        assert!(response_cookies(&json!({"result": {"cookies": "nope"}})).is_err());
+    }
+}

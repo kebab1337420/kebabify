@@ -222,16 +222,17 @@ async fn handle_client(
     let method = parts[0];
     let path = parts[1];
     let origin = request_origin(&header_block);
+    let endpoint = endpoint_for(method, path);
 
     // CORS preflight: Spotify's fetch() from xpui would otherwise be blocked
     // before the real request happens. Answered for any path, no auth needed.
-    if method == "OPTIONS" {
+    if endpoint == Endpoint::Preflight {
         write_preflight(&mut write_half, origin.as_deref()).await?;
         return Ok(());
     }
 
     // ===== Admin endpoints =====
-    if path == "/health" {
+    if endpoint == Endpoint::Health {
         // Only answer to requests from allowed origins (or non-browser clients).
         if let Some(o) = origin.as_deref() {
             if !is_allowed_origin(o) {
@@ -267,7 +268,7 @@ async fn handle_client(
         return Ok(());
     }
 
-    if path == "/shutdown" {
+    if endpoint == Endpoint::Shutdown {
         // Require a valid Origin. Media requests (<audio> embeds, etc.) don't
         // send an Origin header, so a hostile web page could otherwise kill
         // the proxy with <audio src="http://127.0.0.1:18900/shutdown">.
@@ -500,6 +501,29 @@ async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
 /// Builds the 502 JSON body. Pure for tests.
 fn stream_error_body(hint: &str, reason: &str) -> String {
     serde_json::json!({"status": "error", "hint": hint, "reason": reason}).to_string()
+}
+
+/// Which handler serves a request. Pure for tests.
+#[derive(Debug, PartialEq, Eq)]
+enum Endpoint {
+    Preflight,
+    Health,
+    Shutdown,
+    Audio,
+}
+
+/// Classifies a request by method + path. Preflight wins over everything so
+/// a CORS probe never reaches an admin handler.
+fn endpoint_for(method: &str, path: &str) -> Endpoint {
+    if method == "OPTIONS" {
+        Endpoint::Preflight
+    } else if path == "/health" {
+        Endpoint::Health
+    } else if path == "/shutdown" {
+        Endpoint::Shutdown
+    } else {
+        Endpoint::Audio
+    }
 }
 
 /// Writes a `400 Bad Request` JSON response for unparseable track requests,
@@ -751,6 +775,23 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(text.contains("Access-Control-Allow-Origin: https://open.spotify.com\r\n"));
         assert!(text.contains("invalid track id"));
+    }
+
+    #[test]
+    fn endpoints_classified() {
+        assert_eq!(endpoint_for("GET", "/health"), Endpoint::Health);
+        assert_eq!(endpoint_for("GET", "/shutdown"), Endpoint::Shutdown);
+        assert_eq!(
+            endpoint_for("GET", "/?track=4uLU6hMCjMI75M1A2tKUQC"),
+            Endpoint::Audio
+        );
+        // Preflight wins regardless of path.
+        assert_eq!(endpoint_for("OPTIONS", "/health"), Endpoint::Preflight);
+        assert_eq!(endpoint_for("OPTIONS", "/shutdown"), Endpoint::Preflight);
+        assert_eq!(endpoint_for("OPTIONS", "/?track=x"), Endpoint::Preflight);
+        // Near-misses are audio (→ 400 downstream), not admin endpoints.
+        assert_eq!(endpoint_for("GET", "/health?x=1"), Endpoint::Audio);
+        assert_eq!(endpoint_for("POST", "/shutdown"), Endpoint::Shutdown);
     }
 
     #[test]
