@@ -33,7 +33,7 @@ While Spotify plays, the extension redirects audio requests to a local proxy on 
 ## Uninstall
 
 ```powershell
-kebabify.exe uninstall   # stops the proxy, restores user.css/index.html from backup
+kebabify.exe uninstall   # stops the proxy, restores originals, deletes backup dirs (clean-reinstall ready; cookies are kept)
 ```
 
 ## Develop

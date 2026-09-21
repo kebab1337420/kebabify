@@ -173,19 +173,7 @@ async fn main() -> Result<()> {
                     // Probe first: if a proxy is already running (previous apply,
                     // or Spotify restarted while it stayed up) reuse it instead of
                     // spawning a duplicate that would fail the port bind.
-                    let health_url = format!(
-                        "http://{}:{}/health",
-                        audio_proxy::PROXY_HOST,
-                        audio_proxy::PROXY_PORT
-                    );
-                    let probe_client = reqwest::Client::new();
-                    let already_running = probe_client
-                        .get(&health_url)
-                        .timeout(std::time::Duration::from_millis(400))
-                        .send()
-                        .await
-                        .map(|r| r.status().is_success())
-                        .unwrap_or(false);
+                    let already_running = audio_proxy::AudioProxy::is_running().await;
 
                     if already_running {
                         println!(
@@ -209,20 +197,10 @@ async fn main() -> Result<()> {
                         let _child = cmd.spawn().context("Failed to start audio proxy process")?;
 
                         // Wait for the proxy to be ready before proceeding.
-                        let mut proxy_ready = false;
-                        for _ in 0..20 {
-                            if probe_client
-                                .get(&health_url)
-                                .timeout(std::time::Duration::from_secs(1))
-                                .send()
-                                .await
-                                .is_ok()
-                            {
-                                proxy_ready = true;
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        }
+                        let proxy_ready = audio_proxy::AudioProxy::wait_until_ready(
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await;
                         if proxy_ready {
                             println!(
                                 "Audio proxy started on {}:{} (FLAC mode, detached)",
