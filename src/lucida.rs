@@ -202,16 +202,39 @@ const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 // `audio_proxy`, which only sets a connect timeout).
 
 /// A resolved, ready-to-download FLAC stream from lucida.to.
+#[derive(Debug)]
 pub struct LucidaStream {
     /// The HTTP response for the audio download, ready to be streamed.
     pub response: reqwest::Response,
+}
+
+/// Endpoint set for the lucida flow. `Default` is production; tests inject a
+/// local mock. Injectable bases also leave the door open to mirrors.
+#[derive(Clone, Debug)]
+pub struct LucidaEndpoints {
+    /// Resolve host, e.g. `https://lucida.to`.
+    pub base: String,
+    /// Full stream-request URL.
+    pub api_load: String,
+    /// Status URL template with `{server}` and `{handoff}` placeholders.
+    pub status_tpl: String,
+}
+
+impl Default for LucidaEndpoints {
+    fn default() -> Self {
+        Self {
+            base: LUCIDA_BASE.to_string(),
+            api_load: LUCIDA_API_LOAD.to_string(),
+            status_tpl: "https://{server}.lucida.to/api/fetch/request/{handoff}".to_string(),
+        }
+    }
 }
 
 /// Builds the status + download URLs from the API's `server`/`handoff`.
 /// Both come from the network, so both are validated: `server` becomes a DNS
 /// label and `handoff` a path segment — anything else is rejected instead of
 /// being interpolated into a request URL. Pure for tests.
-fn status_urls(server: &str, handoff: &str) -> Result<(String, String)> {
+fn status_urls(tpl: &str, server: &str, handoff: &str) -> Result<(String, String)> {
     let server_ok = !server.is_empty()
         && server
             .bytes()
@@ -226,7 +249,9 @@ fn status_urls(server: &str, handoff: &str) -> Result<(String, String)> {
     if !handoff_ok {
         return Err(anyhow!("lucida API returned a bad handoff ID"));
     }
-    let status_url = format!("https://{}.lucida.to/api/fetch/request/{}", server, handoff);
+    let status_url = tpl
+        .replace("{server}", server)
+        .replace("{handoff}", handoff);
     let download_url = format!("{}/download", status_url);
     Ok((status_url, download_url))
 }
@@ -247,12 +272,30 @@ pub async fn open_stream(
     range: Option<&str>,
     if_range: Option<&str>,
 ) -> Result<LucidaStream> {
+    open_stream_with(
+        client,
+        spotify_url,
+        range,
+        if_range,
+        &LucidaEndpoints::default(),
+    )
+    .await
+}
+
+/// Same as [`open_stream`] with injectable endpoints (tests, mirrors).
+async fn open_stream_with(
+    client: &reqwest::Client,
+    spotify_url: &str,
+    range: Option<&str>,
+    if_range: Option<&str>,
+    ep: &LucidaEndpoints,
+) -> Result<LucidaStream> {
     // Load the captured browser session (UA + Cloudflare cookies) once, so the
     // user can rotate cookies and re-open a stream without restarting.
     let session = load_session();
 
     // Step 1: resolve the track page to obtain the CSRF token.
-    let resolve_url = format!("{}/{}", LUCIDA_BASE, urlencoding::encode(spotify_url));
+    let resolve_url = format!("{}/{}", ep.base, urlencoding::encode(spotify_url));
     let resolve_resp = identify(client.get(&resolve_url), session.as_ref())
         .timeout(REQUEST_TIMEOUT)
         .send()
@@ -293,7 +336,7 @@ pub async fn open_stream(
         "url": spotify_url,
     });
 
-    let dl_resp = identify(client.post(LUCIDA_API_LOAD), session.as_ref())
+    let dl_resp = identify(client.post(&ep.api_load), session.as_ref())
         .timeout(REQUEST_TIMEOUT)
         .json(&download_req)
         .send()
@@ -314,7 +357,7 @@ pub async fn open_stream(
 
     let handoff = dl.get("handoff").and_then(|v| v.as_str()).unwrap_or("");
     let server = dl.get("server").and_then(|v| v.as_str()).unwrap_or("api");
-    let (status_url, download_url) = status_urls(server, handoff)?;
+    let (status_url, download_url) = status_urls(&ep.status_tpl, server, handoff)?;
 
     // Step 3: poll until the track is ready to stream.
     let mut ready = false;
@@ -488,19 +531,20 @@ mod tests {
 
     #[test]
     fn status_urls_validated() {
-        let (s, d) = status_urls("s1", "abc-123_XY").unwrap();
+        let tpl = "https://{server}.lucida.to/api/fetch/request/{handoff}";
+        let (s, d) = status_urls(tpl, "s1", "abc-123_XY").unwrap();
         assert_eq!(s, "https://s1.lucida.to/api/fetch/request/abc-123_XY");
         assert_eq!(
             d,
             "https://s1.lucida.to/api/fetch/request/abc-123_XY/download"
         );
-        assert!(status_urls("", "abc").is_err());
-        assert!(status_urls("api", "").is_err());
-        assert!(status_urls("evil.com", "abc").is_err());
-        assert!(status_urls("a/b", "abc").is_err());
-        assert!(status_urls("api", "../x").is_err());
-        assert!(status_urls("api", "a b").is_err());
-        assert!(status_urls("api", "a?b").is_err());
+        assert!(status_urls(tpl, "", "abc").is_err());
+        assert!(status_urls(tpl, "api", "").is_err());
+        assert!(status_urls(tpl, "evil.com", "abc").is_err());
+        assert!(status_urls(tpl, "a/b", "abc").is_err());
+        assert!(status_urls(tpl, "api", "../x").is_err());
+        assert!(status_urls(tpl, "api", "a b").is_err());
+        assert!(status_urls(tpl, "api", "a?b").is_err());
     }
 
     #[test]
@@ -585,5 +629,107 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::env::remove_var("KEBABIFY_COOKIES_PATH");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use crate::mock::{MockServer, Route};
+
+    const MOCK_AUDIO: &[u8] = b"fLaC-audio-bytes-0123456789";
+
+    fn mock_endpoints(mock: &MockServer) -> LucidaEndpoints {
+        LucidaEndpoints {
+            base: mock.base_url.clone(),
+            api_load: format!("{}/api/load", mock.base_url),
+            status_tpl: format!("{}/status/{{handoff}}", mock.base_url),
+        }
+    }
+
+    fn resolve_html() -> Vec<u8> {
+        br#"<html><script>var t={"token":"tok123","token_expiry":999};</script></html>"#.to_vec()
+    }
+
+    /// Full flow against a canned upstream: resolve → token → load →
+    /// processing → ready → download, plain and ranged.
+    #[tokio::test]
+    async fn full_flow_polls_then_streams_with_range() {
+        let mock = MockServer::start(vec![
+            Route::new(
+                "/api/load",
+                vec![(200, br#"{"handoff":"h1","server":"mock"}"#.to_vec())],
+            ),
+            // Suffix first: /status/h1/download must not hit the poll route.
+            Route::new("/status/", vec![(200, MOCK_AUDIO.to_vec())])
+                .ending_with("/download")
+                .ranged(),
+            Route::new(
+                "/status/",
+                vec![
+                    (200, br#"{"status":"processing"}"#.to_vec()),
+                    (200, br#"{"status":"ready"}"#.to_vec()),
+                ],
+            ),
+            Route::catch_all(200, resolve_html()),
+        ])
+        .await;
+        let ep = mock_endpoints(&mock);
+        let client = reqwest::Client::new();
+
+        let s = open_stream_with(
+            &client,
+            "https://open.spotify.com/track/abc",
+            None,
+            None,
+            &ep,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.response.status(), 200);
+        assert_eq!(s.response.bytes().await.unwrap().as_ref(), MOCK_AUDIO);
+
+        let s = open_stream_with(
+            &client,
+            "https://open.spotify.com/track/abc",
+            Some("bytes=0-3"),
+            None,
+            &ep,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.response.status(), 206);
+        assert_eq!(s.response.bytes().await.unwrap().as_ref(), &MOCK_AUDIO[..4]);
+    }
+
+    /// Status endpoint dead (connection refused): fail fast on transport
+    /// errors instead of burning all 30 polls.
+    #[tokio::test]
+    async fn status_transport_errors_fail_fast() {
+        let mock = MockServer::start(vec![
+            Route::new(
+                "/api/load",
+                vec![(200, br#"{"handoff":"h1","server":"mock"}"#.to_vec())],
+            ),
+            Route::catch_all(200, resolve_html()),
+        ])
+        .await;
+        let dead = MockServer::reserve_port().await;
+        let ep = LucidaEndpoints {
+            base: mock.base_url.clone(),
+            api_load: format!("{}/api/load", mock.base_url),
+            status_tpl: format!("http://127.0.0.1:{}/status/{{handoff}}", dead),
+        };
+        let client = reqwest::Client::new();
+        let err = open_stream_with(
+            &client,
+            "https://open.spotify.com/track/abc",
+            None,
+            None,
+            &ep,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("unreachable"),
+            "unexpected error: {:#}",
+            err
+        );
     }
 }

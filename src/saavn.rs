@@ -98,6 +98,25 @@ const VARIANT_MARKERS: &[&str] = &[
     "nightcore",
 ];
 
+/// Endpoint set for the Saavn flow. `Default` is production; tests inject a
+/// local mock.
+#[derive(Clone, Debug)]
+pub struct SaavnEndpoints {
+    /// Spotify embed host, e.g. `https://open.spotify.com`.
+    pub embed_base: String,
+    /// JioSaavn API host, e.g. `https://www.jiosaavn.com`.
+    pub api_base: String,
+}
+
+impl Default for SaavnEndpoints {
+    fn default() -> Self {
+        Self {
+            embed_base: "https://open.spotify.com".to_string(),
+            api_base: "https://www.jiosaavn.com".to_string(),
+        }
+    }
+}
+
 /// Resolves a Spotify track ID to a streaming Saavn response.
 ///
 /// `range` is forwarded like in [`crate::lucida`] so seeking keeps working.
@@ -107,12 +126,30 @@ pub async fn open_stream(
     range: Option<&str>,
     if_range: Option<&str>,
 ) -> Result<SaavnStream> {
+    open_stream_with(
+        client,
+        track_id,
+        range,
+        if_range,
+        &SaavnEndpoints::default(),
+    )
+    .await
+}
+
+/// Same as [`open_stream`] with injectable endpoints (tests).
+async fn open_stream_with(
+    client: &reqwest::Client,
+    track_id: &str,
+    range: Option<&str>,
+    if_range: Option<&str>,
+    ep: &SaavnEndpoints,
+) -> Result<SaavnStream> {
     if let Some(url) = cached_cdn_url(track_id) {
         return stream_cdn(client, &url, range, if_range).await;
     }
-    let meta = track_meta(client, track_id).await?;
+    let meta = track_meta(client, track_id, &ep.embed_base).await?;
     let query = format!("{} {}", meta.title, meta.artist);
-    let candidates = search_candidates(client, &query).await?;
+    let candidates = search_candidates(client, &query, &ep.api_base).await?;
     let picked = candidates
         .iter()
         .map(|c| (score_candidate(&meta, c), c))
@@ -135,9 +172,9 @@ pub async fn open_stream(
     let cdn_url = match picked.enc_url.as_deref() {
         Some(enc) => match decrypt_media_url(enc) {
             Ok(url) => url,
-            Err(_) => details_media_url(client, &picked.token).await?,
+            Err(_) => details_media_url(client, &ep.api_base, &picked.token).await?,
         },
-        None => details_media_url(client, &picked.token).await?,
+        None => details_media_url(client, &ep.api_base, &picked.token).await?,
     };
     store_cdn_url(track_id, cdn_url.clone());
     stream_cdn(client, &cdn_url, range, if_range).await
@@ -166,8 +203,12 @@ async fn stream_cdn(
 }
 
 /// Fetches title/artist/duration from the public Spotify embed page.
-async fn track_meta(client: &reqwest::Client, track_id: &str) -> Result<TrackMeta> {
-    let url = format!("https://open.spotify.com/embed/track/{}", track_id);
+async fn track_meta(
+    client: &reqwest::Client,
+    track_id: &str,
+    embed_base: &str,
+) -> Result<TrackMeta> {
+    let url = format!("{}/embed/track/{}", embed_base, track_id);
     let html = client
         .get(&url)
         .timeout(REQUEST_TIMEOUT)
@@ -221,11 +262,15 @@ fn next_data_blob(html: &str) -> Option<&str> {
 }
 
 /// Searches JioSaavn for `query` ("title artist").
-async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<Candidate>> {
+async fn search_candidates(
+    client: &reqwest::Client,
+    query: &str,
+    api_base: &str,
+) -> Result<Vec<Candidate>> {
     let encoded = super::lucida::urlencoding::encode(query);
     let url = format!(
-        "https://www.jiosaavn.com/api.php?__call=search.getResults&p=1&q={}&n_song=10&n_album=0&n_artist=0&n_playlist=0&api_version=4&_format=json&_marker=0&ctx=web6dot0",
-        encoded
+        "{}/api.php?__call=search.getResults&p=1&q={}&n_song=10&n_album=0&n_artist=0&n_playlist=0&api_version=4&_format=json&_marker=0&ctx=web6dot0",
+        api_base, encoded
     );
     let json: serde_json::Value = client
         .get(&url)
@@ -397,11 +442,15 @@ fn normalize(s: &str) -> String {
 }
 
 /// Resolves a Saavn perma-url token to a 320kbps CDN URL.
-async fn details_media_url(client: &reqwest::Client, token: &str) -> Result<String> {
+async fn details_media_url(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+) -> Result<String> {
     let encoded = super::lucida::urlencoding::encode(token);
     let url = format!(
-        "https://www.jiosaavn.com/api.php?__call=webapi.get&token={}&type=song&api_version=4&_format=json&_marker=0&ctx=web6dot0&include_meta_tags=0",
-        encoded
+        "{}/api.php?__call=webapi.get&token={}&type=song&api_version=4&_format=json&_marker=0&ctx=web6dot0&include_meta_tags=0",
+        api_base, encoded
     );
     let json: serde_json::Value = client
         .get(&url)
@@ -572,6 +621,112 @@ mod tests {
         assert!(!cache_is_fresh(
             std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_secs(1)
         ));
+    }
+
+    use crate::mock::{MockServer, Route};
+
+    const MOCK_SONG: &[u8] = b"mp4-audio-byTES-0123456789";
+
+    /// DES-ECB encryption mirroring [`decrypt_media_url`], to mint a valid
+    /// `encrypted_media_url` pointing back at the mock (fully offline).
+    fn encrypt_media_url(plain: &str) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+        use des::Des;
+        let mut data = plain.as_bytes().to_vec();
+        let pad = 8 - (data.len() % 8);
+        data.extend(std::iter::repeat_n(pad as u8, pad));
+        let cipher = Des::new_from_slice(b"38346591").unwrap();
+        let (blocks, _) = data.as_chunks_mut::<8>();
+        for c in blocks {
+            cipher.encrypt_block(GenericArray::from_mut_slice(c));
+        }
+        STANDARD.encode(&data)
+    }
+
+    fn embed_html() -> Vec<u8> {
+        br#"<html><head><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"title":"Test Song","artists":[{"name":"Test Artist"}],"duration":200000}}}}}}</script></head></html>"#.to_vec()
+    }
+
+    /// Full flow against a canned upstream: embed → search → decrypt (no
+    /// details round-trip) → CDN stream, plain and ranged.
+    #[tokio::test]
+    async fn full_flow_resolves_and_streams_with_range() {
+        let port = MockServer::reserve_port().await;
+        let cdn_plain = format!("http://127.0.0.1:{}/cdn/song_96.mp4", port);
+        let enc = encrypt_media_url(&cdn_plain);
+        let search_json = serde_json::json!({
+            "total": 1,
+            "results": [{
+                "id": "mock1",
+                "title": "Test Song",
+                "perma_url": "https://www.jiosaavn.com/song/test-song/TOK999",
+                "more_info": {
+                    "duration": "200",
+                    "320kbps": "true",
+                    "encrypted_media_url": enc,
+                    "artistMap": {"primary_artists": [{"name": "Test Artist"}]},
+                },
+            }],
+        });
+        let mock = MockServer::start_on(
+            port,
+            vec![
+                Route::new("/embed/track/", vec![(200, embed_html())]),
+                Route::new(
+                    "/api.php",
+                    vec![(200, serde_json::to_vec(&search_json).unwrap())],
+                )
+                .containing("search.getResults"),
+                Route::new("/cdn/", vec![(200, MOCK_SONG.to_vec())]).ranged(),
+            ],
+        )
+        .await;
+        let ep = SaavnEndpoints {
+            embed_base: mock.base_url.clone(),
+            api_base: mock.base_url.clone(),
+        };
+        let client = reqwest::Client::new();
+
+        let s = open_stream_with(&client, "mock-track-0001", None, None, &ep)
+            .await
+            .unwrap();
+        assert_eq!(s.response.status(), 200);
+        assert_eq!(s.response.bytes().await.unwrap().as_ref(), MOCK_SONG);
+
+        // Second call is served from the CDN cache (no re-resolve).
+        let s = open_stream_with(&client, "mock-track-0001", Some("bytes=0-3"), None, &ep)
+            .await
+            .unwrap();
+        assert_eq!(s.response.status(), 206);
+        assert_eq!(s.response.bytes().await.unwrap().as_ref(), &MOCK_SONG[..4]);
+    }
+
+    /// `details` path with a live-captured vector: pointer parse + decrypt,
+    /// no network beyond the mock.
+    #[tokio::test]
+    async fn details_returns_decrypted_url() {
+        let json = serde_json::json!({
+            "songs": [{
+                "more_info": {
+                    "encrypted_media_url": "ID2ieOjCrwfgWvL5sXl4B1ImC5QfbsDyYqTeQhwXaYSdItBd3yyPjx9EXyrmCoUJ5JZ80nD2NlMvQdU26Ke9GBw7tS9a8Gtq",
+                },
+            }],
+        });
+        let mock = MockServer::start(vec![Route::new(
+            "/api.php",
+            vec![(200, serde_json::to_vec(&json).unwrap())],
+        )
+        .containing("webapi.get")])
+        .await;
+        let client = reqwest::Client::new();
+        let url = details_media_url(&client, &mock.base_url, "TOK")
+            .await
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://aac.saavncdn.com/031/2a333cdb53818e9c18a075ffe8f52e42_320.mp4"
+        );
     }
 
     #[test]

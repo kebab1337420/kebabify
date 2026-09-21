@@ -24,6 +24,9 @@ mod lucida;
 mod patcher;
 mod saavn;
 
+#[cfg(test)]
+mod mock;
+
 #[derive(Parser)]
 #[command(name = "kebabify", version, about)]
 #[command(long_about = None)]
