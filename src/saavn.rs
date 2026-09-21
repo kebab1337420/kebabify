@@ -39,6 +39,40 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Minimum score (see [`score_candidate`]) to accept a Saavn result.
 const ACCEPT_SCORE: i32 = 80;
 
+/// Duration gap (seconds) beyond which a hit is a different recording,
+/// however similar the title/artist look (live, extended, radio edit).
+/// Without this gate, "Hello – Adele (live, untagged)" scores 85 and plays.
+const MAX_DURATION_GAP_S: u64 = 15;
+
+/// Resolved CDN URLs cached per track ID: when lucida is down, every track
+/// would otherwise pay embed + search + details round-trips again. Links
+/// carry no visible expiry; 10 min TTL stays well clear of rotations.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Track ID → (CDN URL, resolved-at). Positive hits only; misses surface so
+/// catalog changes are picked up on the next try instead of going stale.
+static CDN_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Cached CDN URL when fresh, else `None`. Pure-ish (clock) — tested via
+/// [`cache_is_fresh`].
+fn cached_cdn_url(track_id: &str) -> Option<String> {
+    let guard = CDN_CACHE.lock().ok()?;
+    let (url, at) = guard.get(track_id)?;
+    cache_is_fresh(*at).then(|| url.clone())
+}
+
+fn cache_is_fresh(at: std::time::Instant) -> bool {
+    at.elapsed() < CACHE_TTL
+}
+
+fn store_cdn_url(track_id: &str, url: String) {
+    if let Ok(mut guard) = CDN_CACHE.lock() {
+        guard.insert(track_id.to_string(), (url, std::time::Instant::now()));
+    }
+}
+
 /// Markers that disqualify a result unless the query has them too.
 /// Without this, "Cut To The Feeling" happily matches a karaoke cover.
 const VARIANT_MARKERS: &[&str] = &[
@@ -61,7 +95,11 @@ pub async fn open_stream(
     client: &reqwest::Client,
     track_id: &str,
     range: Option<&str>,
+    if_range: Option<&str>,
 ) -> Result<SaavnStream> {
+    if let Some(url) = cached_cdn_url(track_id) {
+        return stream_cdn(client, &url, range, if_range).await;
+    }
     let meta = track_meta(client, track_id).await?;
     let query = format!("{} {}", meta.title, meta.artist);
     let candidates = search_candidates(client, &query).await?;
@@ -81,9 +119,24 @@ pub async fn open_stream(
         })?;
 
     let cdn_url = details_media_url(client, &picked.token).await?;
-    let mut req = client.get(&cdn_url);
+    store_cdn_url(track_id, cdn_url.clone());
+    stream_cdn(client, &cdn_url, range, if_range).await
+}
+
+/// GETs a resolved CDN URL (Range/If-Range forwarded, body unbounded like
+/// every other download in this codebase).
+async fn stream_cdn(
+    client: &reqwest::Client,
+    cdn_url: &str,
+    range: Option<&str>,
+    if_range: Option<&str>,
+) -> Result<SaavnStream> {
+    let mut req = client.get(cdn_url);
     if let Some(r) = range {
         req = req.header("Range", r);
+    }
+    if let Some(v) = if_range {
+        req = req.header("If-Range", v);
     }
     let resp = req.send().await.context("Saavn: CDN download failed")?;
     if !resp.status().is_success() {
@@ -187,7 +240,11 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
         let token = item
             .get("perma_url")
             .and_then(|v| v.as_str())
+            // Tokens ride as the last path segment: trim a trailing slash
+            // and drop ?query/#fragment so `details` gets a clean token.
+            .map(|u| u.trim_end_matches('/'))
             .and_then(|u| u.rsplit('/').next())
+            .and_then(|s| s.split(['?', '#']).next())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         let Some(token) = token else { continue };
@@ -213,8 +270,7 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
             artists,
             duration_s: more
                 .and_then(|m| m.get("duration"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
+                .map(parse_saavn_duration)
                 .unwrap_or(0),
             has_320: more.and_then(|m| m.get("320kbps")).and_then(|v| v.as_str()) == Some("true"),
         });
@@ -224,11 +280,38 @@ async fn search_candidates(client: &reqwest::Client, query: &str) -> Result<Vec<
 
 /// Scores a Saavn hit against the Spotify metadata. Pure for tests.
 fn score_candidate(meta: &TrackMeta, c: &Candidate) -> i32 {
+    score_candidate_inner(meta, c, &normalize(&meta.artist))
+}
+
+/// Duration as seconds: Saavn usually sends `"206"`, but a JSON number or a
+/// float string must not silently become 0 (which would forfeit 20 points).
+fn parse_saavn_duration(v: &serde_json::Value) -> u64 {
+    if let Some(n) = v.as_u64() {
+        return n;
+    }
+    if let Some(n) = v.as_f64() {
+        return n as u64;
+    }
+    v.as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| f as u64)
+        .unwrap_or(0)
+}
+
+fn score_candidate_inner(meta: &TrackMeta, c: &Candidate, want_artist: &str) -> i32 {
     let want_title = normalize(&meta.title);
     let got_title = normalize(&c.title);
     if want_title.is_empty() || got_title.is_empty() {
         return 0;
     }
+
+    // Duration gate first: >15s off means a different recording (live,
+    // extended, radio edit), however similar the names look.
+    let want_s = meta.duration_ms / 1000;
+    if want_s.abs_diff(c.duration_s) > MAX_DURATION_GAP_S {
+        return 0;
+    }
+
     let mut score = 0;
 
     // Title: exact ≫ contains ≫ nothing.
@@ -241,19 +324,17 @@ fn score_candidate(meta: &TrackMeta, c: &Candidate) -> i32 {
     }
 
     // Artist must appear on either side.
-    let want_artist = normalize(&meta.artist);
     let artist_hit = c
         .artists
         .iter()
         .map(|a| normalize(a))
-        .any(|a| !a.is_empty() && (a.contains(&want_artist) || want_artist.contains(&a)));
+        .any(|a| !a.is_empty() && (a.contains(want_artist) || want_artist.contains(&a)));
     if !artist_hit {
         return 0;
     }
     score += 30;
 
     // Duration within tolerance (embed reports ms, Saavn seconds).
-    let want_s = meta.duration_ms / 1000;
     let gap = want_s.abs_diff(c.duration_s);
     if gap <= 5 {
         score += 20;
@@ -339,7 +420,18 @@ fn decrypt_media_url(enc: &str) -> Result<String> {
     }
     data.truncate(data.len() - pad);
     let url = String::from_utf8(data).context("Saavn: decrypted URL is not UTF-8")?;
-    Ok(url.replace("_96", "_320"))
+    Ok(upgrade_quality(&url))
+}
+
+/// Swaps a trailing low-quality marker (`…_96.mp4`) for `_320`. Trailing-only:
+/// a blind `replace` would also rewrite a hash/path segment that happens to
+/// contain `_96`. Without a known marker the URL is returned as-is (still
+/// playable, just not 320). Pure for tests.
+fn upgrade_quality(url: &str) -> String {
+    match url.rfind("_96.") {
+        Some(pos) => format!("{}_320.{}", &url[..pos], &url[pos + 4..]),
+        None => url.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -406,10 +498,46 @@ mod tests {
     }
 
     #[test]
-    fn far_duration_penalized_but_artist_title_carry() {
-        // Same title+artist, 30s off (e.g. extended mix): still accepted.
+    fn far_duration_rejected_as_different_recording() {
+        // Same title+artist but 30s off (live/extended, untagged): gated.
         let c = cand("Cut To The Feeling", &["Carly Rae Jepsen"], 238);
+        assert_eq!(score_candidate(&meta(), &c), 0);
+    }
+
+    #[test]
+    fn near_duration_accepted_without_bonus() {
+        // 12s off: no duration points, title+artist still carry it.
+        let c = cand("Cut To The Feeling", &["Carly Rae Jepsen"], 220);
         assert!(score_candidate(&meta(), &c) >= ACCEPT_SCORE);
+    }
+
+    #[test]
+    fn quality_swap_is_trailing_only() {
+        assert_eq!(
+            upgrade_quality("https://x/_96abc_96.mp4"),
+            "https://x/_96abc_320.mp4"
+        );
+        assert_eq!(
+            upgrade_quality("https://x/song_320.mp4"),
+            "https://x/song_320.mp4"
+        );
+    }
+
+    #[test]
+    fn durations_parse_numbers_and_floats() {
+        assert_eq!(parse_saavn_duration(&serde_json::json!(208)), 208);
+        assert_eq!(parse_saavn_duration(&serde_json::json!(207.9)), 207);
+        assert_eq!(parse_saavn_duration(&serde_json::json!("206")), 206);
+        assert_eq!(parse_saavn_duration(&serde_json::json!("n/a")), 0);
+        assert_eq!(parse_saavn_duration(&serde_json::Value::Null), 0);
+    }
+
+    #[test]
+    fn cache_freshness() {
+        assert!(cache_is_fresh(std::time::Instant::now()));
+        assert!(!cache_is_fresh(
+            std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_secs(1)
+        ));
     }
 
     #[test]

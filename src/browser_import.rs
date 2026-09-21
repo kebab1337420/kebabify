@@ -25,6 +25,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// frozen renderer can't hang `import-cookies` past the challenge deadline.
 const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Shared client for CDP endpoint polling (one pool, not one per poll).
+static SHARED_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -187,11 +191,10 @@ async fn user_agent_of(cdp: &mut Cdp) -> Result<String> {
 
 /// Polls the CDP HTTP endpoint until a page target opens, returns its ws URL.
 async fn wait_for_page(port: u16) -> Option<String> {
-    let client = reqwest::Client::new();
     let list_url = format!("http://127.0.0.1:{}/json", port);
     let deadline = std::time::Instant::now() + CHROME_START_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client
+        if let Ok(resp) = SHARED_CLIENT
             .get(&list_url)
             .timeout(Duration::from_secs(2))
             .send()

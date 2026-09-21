@@ -120,31 +120,41 @@
                     if (!flacPriority) return originalFetch.call(this, input, init);
                     var self = this;
                     var url = typeof input === 'string' ? input : (input && input.url) || '';
+                    var originalInput = input;
                     var originalUrl = url;
                     if (isSpotifyAudioRequest(url)) {
                         var redirected = tryRedirectToProxy(url);
                         if (redirected) {
-                            input = redirected;
+                            // Preserve Request semantics (Range headers, mode,
+                            // credentials): a bare string would drop them and
+                            // the upstream would answer 200 instead of 206.
+                            if (typeof Request !== 'undefined' && input instanceof Request) {
+                                try { input = new Request(redirected, input); }
+                                catch(e) { input = redirected; }
+                            } else {
+                                input = redirected;
+                            }
                         }
                     }
+                    var wasProxified = isProxifiedUrl(input);
                     return originalFetch.call(self, input, init).then(function(resp) {
                         // Proxy failure (lucida down, missing cookies…) → retry
-                        // the native URL once so the track still plays, in
+                        // the native input once so the track still plays, in
                         // Spotify quality, instead of erroring out.
-                        if (flacPriority && resp && resp.status === 502 && isProxified(input) && originalUrl && originalUrl !== input) {
+                        if (flacPriority && resp && resp.status === 502 && wasProxified && originalUrl && originalUrl !== urlString(input)) {
                             console.warn('[kebabify] Proxy 502, falling back to native audio');
                             flacVerified = false;
                             refreshBadge();
-                            return originalFetch.call(self, originalUrl, init);
+                            return originalFetch.call(self, originalInput, init);
                         }
                         return resp;
                     }, function(err) {
                         // Network-level failure on a proxified URL → same fallback.
-                        if (flacPriority && isProxified(input) && originalUrl && originalUrl !== input) {
+                        if (flacPriority && wasProxified && originalUrl && originalUrl !== urlString(input)) {
                             console.warn('[kebabify] Proxy unreachable, falling back to native audio');
                             flacVerified = false;
                             refreshBadge();
-                            return originalFetch.call(self, originalUrl, init);
+                            return originalFetch.call(self, originalInput, init);
                         }
                         throw err;
                     });
@@ -199,8 +209,13 @@
         return typeof id === 'string' && /^[A-Za-z0-9]{22}$/.test(id);
     }
 
-    function isProxified(input) {
-        return typeof input === 'string' && input.indexOf(PROXY_AUTH) !== -1;
+    function urlString(input) {
+        return typeof input === 'string' ? input : (input && input.url) || '';
+    }
+
+    function isProxifiedUrl(input) {
+        var u = urlString(input);
+        return u !== '' && u.indexOf(PROXY_AUTH) !== -1;
     }
 
     // Reads the current track ID from the now-playing widget of the Spotify UI.
@@ -214,19 +229,44 @@
         return m ? m[1] : null;
     }
 
-    // Extract a *valid* Spotify track ID from a URL. The regexes are anchored
-    // to 22 base62 chars: a 32-char hex UUID in /track/{uuid} must NOT count.
+    // Extract a *valid* Spotify track ID from a URL.
+    // Same key set as the Rust proxy (`tracks/`, `track_id=`) so both agree.
     function extractTrackId(url) {
         if (!url) return null;
-        var m = url.match(/track\/([A-Za-z0-9]{22})/);
-        if (m && isValidSpotifyTrackId(m[1])) return m[1];
-        m = url.match(/[?&]id=([A-Za-z0-9]{22})/);
-        if (m && isValidSpotifyTrackId(m[1])) return m[1];
-        m = url.match(/[?&]cid=([A-Za-z0-9]{22})/);
-        if (m && isValidSpotifyTrackId(m[1])) return m[1];
-        m = url.match(/spotify:track:([A-Za-z0-9]{22})/);
-        if (m) return m[1];
-        return null;
+        return matchTrackId(url, /tracks?\/([A-Za-z0-9]{22})/)
+            || matchTrackId(url, /[?&](?:track_id|id|cid)=([A-Za-z0-9]{22})/)
+            || matchTrackId(url, /spotify:track:([A-Za-z0-9]{22})/);
+    }
+
+    // Single regex match with a right-boundary check: the 22 chars must not
+    // be the prefix of a longer alnum run, otherwise a 32-hex file UUID in
+    // /track/{uuid} would return its first 22 chars as a bogus track ID.
+    function matchTrackId(url, re) {
+        var m = url.match(re);
+        if (!m || !isValidSpotifyTrackId(m[1])) return null;
+        var after = url.charAt(m.index + m[0].length);
+        if (after && /[A-Za-z0-9]/.test(after)) return null;
+        return m[1];
+    }
+
+    // Media elements ever patched, for observer cleanup: a removed node never
+    // appears in querySelectorAll, so only a stored registry can release it.
+    var trackedMedia = [];
+
+    function trackMedia(media) {
+        if (trackedMedia.indexOf(media) === -1) trackedMedia.push(media);
+    }
+
+    function untrackDisconnectedMedia() {
+        for (var i = trackedMedia.length - 1; i >= 0; i--) {
+            var m = trackedMedia[i];
+            if (!m.isConnected) {
+                try { if (m._kebabifyObserver) m._kebabifyObserver.disconnect(); } catch(e) {}
+                m._kebabifyObserver = null;
+                m._kebabifyPatched = false;
+                trackedMedia.splice(i, 1);
+            }
+        }
     }
 
     // ===== Audio element interception =====
@@ -235,17 +275,11 @@
 
         globalAudioObserver = new MutationObserver(function() {
             try {
+                // Release observers of elements that left the DOM via the
+                // registry (a removed node never shows up in querySelectorAll,
+                // so scanning the live list alone can never find it).
+                untrackDisconnectedMedia();
                 var all = document.querySelectorAll('audio, video');
-                // Release observers of media elements that left the DOM —
-                    // a removed element gets no further mutation callbacks, so
-                    // this is the only guaranteed cleanup point.
-                    all.forEach(function(media) {
-                        if (media._kebabifyObserver && !media.isConnected) {
-                            media._kebabifyObserver.disconnect();
-                            media._kebabifyObserver = null;
-                            media._kebabifyPatched = false;
-                        }
-                    });
                     all.forEach(function(media) {
                         if (!media._kebabifyPatched) {
                             media._kebabifyPatched = true;
@@ -269,6 +303,7 @@
 
     function patchAudioElement(media) {
         try {
+            trackMedia(media);
             // Ahead of the observer: a <audio> inserted by React already
             // carries its src — no attribute mutation will follow, so the
             // current (Spotify) URL would never be redirected. Handle it now.
@@ -299,10 +334,11 @@
 
     // Redirect with a safety net: remember the native URL so a proxy failure
     // restores Spotify audio instead of leaving silence. After a fallback the
-    // element is left alone for 30 s (else error → restore → redirect would
-    // hot-loop); FLAC is retried on the next track.
+    // element is left alone for 30 s *for that track* (else error → restore →
+    // redirect would hot-loop); a new track retries FLAC immediately.
     function redirectMediaWithFallback(media) {
-        if (media._kebabifyFallbackAt && Date.now() - media._kebabifyFallbackAt < 30000) return;
+        if (media._kebabifyFallbackAt && media._kebabifyFallbackTrack === currentSpotifyTrackId &&
+            Date.now() - media._kebabifyFallbackAt < 30000) return;
         var newSrc = tryRedirectToProxy(media.src);
         if (!newSrc || newSrc === media.src) return;
         if (!media._kebabifyOriginalSrc) media._kebabifyOriginalSrc = media.src;
@@ -319,6 +355,7 @@
                 flacVerified = false;
                 refreshBadge();
                 media._kebabifyFallbackAt = Date.now();
+                media._kebabifyFallbackTrack = currentSpotifyTrackId;
                 media.src = media._kebabifyOriginalSrc;
                 media._kebabifyOriginalSrc = null;
             }
@@ -382,7 +419,13 @@
                         else if (flacVerified) ic = svgCheck;
                         else if (proxyAlive) ic = svgSpeaker;
                         else ic = svgOff;
-                        iconSpan.innerHTML = ic + 'KB';
+                        // Skip the DOM write when nothing changed: rewriting
+                        // innerHTML every second churns layout for no benefit.
+                        var html = ic + 'KB';
+                        if (iconSpan._kebabifyHtml !== html) {
+                            iconSpan._kebabifyHtml = html;
+                            iconSpan.innerHTML = html;
+                        }
                     }
                     btn.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
                     btn.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
@@ -524,6 +567,12 @@
                 var nowId = readNowPlayingTrackId();
                 if (nowId && nowId !== currentSpotifyTrackId) {
                     currentSpotifyTrackId = nowId;
+                    // New track, new verdict: track A's ✓ must not linger
+                    // while track B is still buffering (native or proxy).
+                    if (flacVerified) {
+                        flacVerified = false;
+                        updateVerifiedIndicator();
+                    }
                     console.log('[kebabify] Now playing track:', nowId);
                 }
                 var anyPlaying = false;
