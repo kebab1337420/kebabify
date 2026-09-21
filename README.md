@@ -23,6 +23,10 @@ kebabify.exe import-cookies  # import Cloudflare cookies (alias: import)
 
 Pin `kebabify.exe run` instead of Spotify if you want the proxy to live exactly as long as Spotify (no lingering process, fresh proxy on every start). Ctrl+C stops the proxy but leaves Spotify playing.
 
+## Self-update
+
+`kebabify.exe update` (alias: `upgrade`) checks GitHub releases, downloads the new exe, swaps it and re-applies. Inside Spotify, a green pill appears top-right when an update is out — one click updates, then restart Spotify to load the new extension.
+
 ## Unlock lossless audio (lucida.to)
 
 lucida.to sits behind a Cloudflare challenge, so the audio proxy needs browser cookies. Either:

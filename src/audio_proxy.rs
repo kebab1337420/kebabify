@@ -258,6 +258,38 @@ async fn proxy_health() -> Option<HealthState> {
     })
 }
 
+/// Update-check responses cached here so the proxy doesn't hit the GitHub
+/// API (60 anonymous req/h/IP) on every badge poll.
+static UPDATE_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time::Instant, String)>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// Cached `{"update_available", "current", "latest"}` body, refreshed past
+/// [`crate::updater::CHECK_TTL`]. Errors resolve to "no update" (and are
+/// cached too — an offline proxy must not hammer).
+async fn cached_update_check(client: &reqwest::Client) -> String {
+    if let Some((at, body)) = UPDATE_CACHE.lock().await.clone() {
+        if at.elapsed() < crate::updater::CHECK_TTL {
+            return body;
+        }
+    }
+    let body = match crate::updater::check_update(client).await {
+        Ok(Some(info)) => serde_json::json!({
+            "update_available": true,
+            "current": crate::updater::current_version(),
+            "latest": info.version,
+        })
+        .to_string(),
+        _ => serde_json::json!({
+            "update_available": false,
+            "current": crate::updater::current_version(),
+            "latest": serde_json::Value::Null,
+        })
+        .to_string(),
+    };
+    *UPDATE_CACHE.lock().await = Some((std::time::Instant::now(), body.clone()));
+    body
+}
+
 /// Handles a single HTTP request to the proxy.
 ///
 /// Lock order (never inverted anywhere): `current_track`, then
@@ -356,9 +388,10 @@ async fn handle_client(
         return Ok(());
     }
 
-    // Only GET serves content here: anything else (POST/PUT/…) is a client
-    // bug or a probe — answer 400 instead of treating it as audio.
-    if method != "GET" {
+    // Only GET serves content here (plus POST for /update/apply): anything
+    // else is a client bug or a probe — answer 400 instead of treating it
+    // as audio.
+    if method != "GET" && endpoint != Endpoint::UpdateApply {
         write_bad_request(
             &mut write_half,
             origin.as_deref(),
@@ -405,6 +438,69 @@ async fn handle_client(
 
         write_half.write_all(resp.as_bytes()).await?;
         write_half.flush().await?;
+        return Ok(());
+    }
+
+    if endpoint == Endpoint::UpdateCheck {
+        // Same origin rule as /health: allowlisted callers, or non-browser
+        // clients with no Origin at all.
+        if let Some(o) = origin.as_deref() {
+            if !is_allowed_origin(o) {
+                return Err(anyhow!("Forbidden origin for /update/check: {}", o));
+            }
+        }
+        let body = cached_update_check(&client).await;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+            body.len(),
+            cors_header_line(origin.as_deref()),
+            body
+        );
+        write_half.write_all(resp.as_bytes()).await?;
+        write_half.flush().await?;
+        return Ok(());
+    }
+
+    if endpoint == Endpoint::UpdateApply {
+        // Strict: Spotify UI origins only. Unlike /health, an absent Origin
+        // is refused — no curl-triggered self-replacement.
+        match origin.as_deref() {
+            Some(o) if is_allowed_origin(o) => {}
+            _ => {
+                write_forbidden(&mut write_half).await?;
+                return Err(anyhow!("Forbidden origin for /update/apply"));
+            }
+        }
+        let version = match crate::updater::check_update(&client).await? {
+            Some(info) => {
+                let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
+                let staged = crate::updater::staged_path(&exe);
+                crate::updater::download_release(&client, &info, &staged).await?;
+                info.version.clone()
+            }
+            None => String::new(),
+        };
+        let body = if version.is_empty() {
+            serde_json::json!({"status": "up-to-date"}).to_string()
+        } else {
+            serde_json::json!({"status": "updating", "version": version}).to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+            body.len(),
+            cors_header_line(origin.as_deref()),
+            body
+        );
+        write_half.write_all(resp.as_bytes()).await?;
+        write_half.flush().await?;
+        if !version.is_empty() {
+            // Answer went out: die so the swap helper can replace us, then
+            // relaunch `apply` with the new binary.
+            let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
+            shutting_down.store(true, Ordering::Release);
+            crate::updater::stage_and_relaunch(&exe, &crate::updater::staged_path(&exe))?;
+            shutdown.notify_waiters();
+        }
         return Ok(());
     }
 
@@ -710,11 +806,13 @@ enum Endpoint {
     Preflight,
     Health,
     Shutdown,
+    UpdateCheck,
+    UpdateApply,
     Audio,
 }
 
 /// Classifies a request by method + path. Preflight wins over everything so
-/// a CORS probe never reaches an admin handler.
+/// a CORS probe never reaches an admin handler. Update-apply is POST-only.
 fn endpoint_for(method: &str, path: &str) -> Endpoint {
     if method == "OPTIONS" {
         Endpoint::Preflight
@@ -722,6 +820,10 @@ fn endpoint_for(method: &str, path: &str) -> Endpoint {
         Endpoint::Health
     } else if path == "/shutdown" {
         Endpoint::Shutdown
+    } else if path == "/update/check" {
+        Endpoint::UpdateCheck
+    } else if path == "/update/apply" && method == "POST" {
+        Endpoint::UpdateApply
     } else {
         Endpoint::Audio
     }
@@ -1103,6 +1205,10 @@ mod tests {
     fn endpoints_classified() {
         assert_eq!(endpoint_for("GET", "/health"), Endpoint::Health);
         assert_eq!(endpoint_for("GET", "/shutdown"), Endpoint::Shutdown);
+        assert_eq!(endpoint_for("GET", "/update/check"), Endpoint::UpdateCheck);
+        assert_eq!(endpoint_for("POST", "/update/apply"), Endpoint::UpdateApply);
+        // POST anywhere else is not special (→ 400 downstream).
+        assert_eq!(endpoint_for("POST", "/shutdown"), Endpoint::Shutdown);
         assert_eq!(
             endpoint_for("GET", "/?track=4uLU6hMCjMI75M1A2tKUQC"),
             Endpoint::Audio

@@ -212,3 +212,45 @@
 .main-nowPlayingBar-right .main-genericButton-button > span {
     background: transparent !important;
 }
+
+/* =====================================================
+   kebabify self-update badge — fixed top-right pill, only
+   rendered while a newer release is available (see JS).
+   ===================================================== */
+#kebabify-update-badge {
+    position: fixed !important;
+    top: 12px !important;
+    right: 12px !important;
+    z-index: 9999 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    height: 28px !important;
+    padding: 0 12px !important;
+    border-radius: 14px !important;
+    border: 1px solid #1ED760 !important;
+    background: rgba(18, 18, 18, 0.92) !important;
+    color: #1ED760 !important;
+    font-family: 'Spotify Circular', Arial, sans-serif !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    cursor: pointer !important;
+    pointer-events: auto !important;
+    user-select: none !important;
+}
+
+#kebabify-update-badge:hover {
+    background: rgba(30, 215, 96, 0.15) !important;
+}
+
+#kebabify-update-badge[data-kebabify-update="updating"] {
+    border-color: #ffa42b !important;
+    color: #ffa42b !important;
+    cursor: wait !important;
+}
+
+#kebabify-update-badge[data-kebabify-update="done"] {
+    border-color: #1ED760 !important;
+    color: #ffffff !important;
+    background: rgba(30, 215, 96, 0.25) !important;
+    cursor: default !important;
+}
