@@ -15,3 +15,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --all-targets -- -D warnings
+
+  # Validates what releases actually ship (release profile: LTO, strip,
+  # panic=abort). Slower, so a separate job that never blocks `check`.
+  release-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked

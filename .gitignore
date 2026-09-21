@@ -9,3 +9,8 @@ cookies.txt
 # Editors
 .idea/
 .vscode/
+# Runtime artifacts (never commit these)
+proxy.log
+kebabify-cdp-*/
+kebabify-cookies-copy.sqlite*
+kebabify-cap/

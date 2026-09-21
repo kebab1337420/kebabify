@@ -234,7 +234,7 @@
     function extractTrackId(url) {
         if (!url) return null;
         return matchTrackId(url, /tracks?\/([A-Za-z0-9]{22})/)
-            || matchTrackId(url, /[?&](?:track_id|id|cid)=([A-Za-z0-9]{22})/)
+            || matchTrackId(url, /[?&](?:track|track_id|id|cid)=([A-Za-z0-9]{22})/)
             || matchTrackId(url, /spotify:track:([A-Za-z0-9]{22})/);
     }
 
