@@ -81,6 +81,74 @@
         refreshBadge();
     }
 
+    // ===== Self-update badge (top-right) =====
+    // Polls the proxy for a newer release; a click triggers the update and
+    // the badge then asks for a Spotify restart (new JS loads on restart).
+    var updatingNow = false;
+
+    function checkForUpdates() {
+        if (updatingNow) return;
+        fetch(PROXY_BASE + 'update/check')
+            .then(function(resp) {
+                if (!resp.ok) return null;
+                return resp.json();
+            })
+            .then(function(data) {
+                if (data && data.update_available && data.latest) {
+                    showUpdateBadge(data.latest);
+                } else {
+                    hideUpdateBadge();
+                }
+            })
+            .catch(function() {});
+    }
+
+    function showUpdateBadge(latest) {
+        var badge = document.getElementById('kebabify-update-badge');
+        if (!badge) {
+            badge = document.createElement('button');
+            badge.id = 'kebabify-update-badge';
+            badge.type = 'button';
+            badge.onclick = function(e) {
+                e.stopPropagation(); e.preventDefault();
+                triggerUpdate(badge);
+                return false;
+            };
+            (document.body || document.documentElement).appendChild(badge);
+        }
+        badge.textContent = '\u2193 ' + latest + ' — mettre à jour';
+        badge.setAttribute('data-kebabify-update', 'available');
+    }
+
+    function hideUpdateBadge() {
+        var badge = document.getElementById('kebabify-update-badge');
+        if (badge) badge.remove();
+    }
+
+    function triggerUpdate(badge) {
+        if (updatingNow) return;
+        updatingNow = true;
+        badge.textContent = 'Mise à jour…';
+        badge.setAttribute('data-kebabify-update', 'updating');
+        badge.onclick = function(e) { e.stopPropagation(); e.preventDefault(); return false; };
+        fetch(PROXY_BASE + 'update/apply', { method: 'POST' })
+            .then(function(resp) { return resp.ok ? resp.json() : null; })
+            .then(function(data) {
+                if (data && data.status === 'updating') {
+                    badge.textContent = 'Mis à jour — redémarre Spotify';
+                    badge.setAttribute('data-kebabify-update', 'done');
+                } else {
+                    updatingNow = false;
+                    hideUpdateBadge();
+                    checkForUpdates();
+                }
+            })
+            .catch(function() {
+                updatingNow = false;
+                hideUpdateBadge();
+            });
+    }
+
     // ===== FLAC Mode Toggle =====
     window.__kebabifyToggleFlacMode = function() {
         flacPriority = !flacPriority;
@@ -694,6 +762,10 @@
         // Start proxy health check every 3 seconds
         checkProxyHealth();
         setInterval(checkProxyHealth, 3000);
+
+        // Self-update check on start, then every 30 minutes
+        checkForUpdates();
+        setInterval(checkForUpdates, 30 * 60 * 1000);
 
         var lastPath = location.pathname;
         setInterval(function() {

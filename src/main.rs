@@ -25,6 +25,7 @@ mod browser_import;
 mod lucida;
 mod patcher;
 mod saavn;
+mod updater;
 
 #[cfg(test)]
 mod mock;
@@ -49,6 +50,10 @@ enum Commands {
 
     /// Update embedded extensions (CSS themes, JS plugins)
     UpdateExt,
+
+    /// Check GitHub releases and self-update to the newest kebabify
+    #[command(alias = "upgrade")]
+    Update,
 
     /// Show detailed status
     Status,
@@ -316,6 +321,33 @@ async fn cmd_import_cookies() -> Result<()> {
     browser_import::import_from_browser().await
 }
 
+/// Self-update: check, download, stage, hand over to the swap helper, exit.
+/// The helper relaunches `apply`, so the new version re-patches immediately.
+async fn cmd_update() -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("kebabify/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("Failed to build HTTP client")?;
+    println!(
+        "kebabify {} — checking for updates...",
+        updater::current_version()
+    );
+    let Some(info) = updater::check_update(&client).await? else {
+        println!("Already up to date.");
+        return Ok(());
+    };
+    println!("Found v{} — downloading...", info.version);
+    let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
+    let staged = updater::staged_path(&exe);
+    updater::download_release(&client, &info, &staged).await?;
+    println!("Downloaded. Swapping binaries — kebabify will restart itself.");
+    updater::stage_and_relaunch(&exe, &staged)?;
+    // The helper takes it from here; die now so the exe can be replaced.
+    std::process::exit(0);
+}
+
 /// Manual cookie entry for the interactive menu: prompts for both lines.
 async fn cmd_cookie_prompt() -> Result<()> {
     use std::io::{BufRead, Write};
@@ -414,6 +446,7 @@ enum MenuChoice {
     Uninstall,
     Status,
     UpdateExt,
+    Update,
     ImportCookies,
     CookieManual,
     Quit,
@@ -426,7 +459,8 @@ fn parse_menu_choice(line: &str) -> Option<MenuChoice> {
         "a" | "appliquer" | "apply" => Some(MenuChoice::Apply),
         "r" | "run" | "lancer" => Some(MenuChoice::Run),
         "d" | "desinstaller" | "désinstaller" | "uninstall" => Some(MenuChoice::Uninstall),
-        "u" | "update" => Some(MenuChoice::UpdateExt),
+        "u" | "update-ext" => Some(MenuChoice::UpdateExt),
+        "m" | "mettre" | "maj" | "update" | "upgrade" => Some(MenuChoice::Update),
         "s" | "statut" | "status" => Some(MenuChoice::Status),
         "i" | "importer" | "import" | "import-cookies" => Some(MenuChoice::ImportCookies),
         "c" | "cookie" | "manuel" => Some(MenuChoice::CookieManual),
@@ -446,6 +480,7 @@ async fn interactive_menu() -> Result<()> {
         println!("  [R]un supervisé (proxy lié à Spotify)");
         println!("  [D]ésinstaller (restaurer Spotify)");
         println!("  [U]pdate extensions");
+        println!("  [M]ettre à jour kebabify");
         println!("  [S]tatut");
         println!("  [I]mporter les cookies (Cloudflare)");
         println!("  [C]ookie manuel (coller UA + cookies)");
@@ -458,7 +493,7 @@ async fn interactive_menu() -> Result<()> {
             break; // EOF (Ctrl+Z)
         }
         let Some(choice) = parse_menu_choice(&line) else {
-            println!("Choix inconnu, réessaie (A/R/D/U/S/I/C/Q).");
+            println!("Choix inconnu, réessaie (A/R/D/U/M/S/I/C/Q).");
             continue;
         };
         if choice == MenuChoice::Quit {
@@ -470,6 +505,7 @@ async fn interactive_menu() -> Result<()> {
             MenuChoice::Uninstall => cmd_uninstall().await,
             MenuChoice::Status => cmd_status().await,
             MenuChoice::UpdateExt => cmd_update_ext().await,
+            MenuChoice::Update => cmd_update().await,
             MenuChoice::ImportCookies => cmd_import_cookies().await,
             MenuChoice::CookieManual => cmd_cookie_prompt().await,
             MenuChoice::Quit => unreachable!(),
@@ -494,6 +530,7 @@ async fn main() -> Result<()> {
         Some(Commands::Run) => cmd_run().await?,
         Some(Commands::Uninstall) => cmd_uninstall().await?,
         Some(Commands::UpdateExt) => cmd_update_ext().await?,
+        Some(Commands::Update) => cmd_update().await?,
         Some(Commands::Status) => cmd_status().await?,
         Some(Commands::Cookie {
             user_agent,
@@ -536,6 +573,8 @@ mod tests {
         assert_eq!(parse_menu_choice("d"), Some(Uninstall));
         assert_eq!(parse_menu_choice("DÉSINSTALLER"), Some(Uninstall));
         assert_eq!(parse_menu_choice("u"), Some(UpdateExt));
+        assert_eq!(parse_menu_choice("m"), Some(Update));
+        assert_eq!(parse_menu_choice("update"), Some(Update));
         assert_eq!(parse_menu_choice("s"), Some(Status));
         assert_eq!(parse_menu_choice("i"), Some(ImportCookies));
         assert_eq!(parse_menu_choice("c"), Some(CookieManual));
