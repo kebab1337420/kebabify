@@ -631,9 +631,10 @@
                     if (node.nodeType !== 1) return;
                     var selectors = ['[data-testid="ad"]','.ad-container','.ad-showing','.sponsor','.google-ads','.adsbygoogle'];
                     selectors.forEach(function(sel) {
-                        if (node.matches && node.matches(sel)) node.style.display = 'none';
-                        var matches = node.querySelectorAll ? node.querySelectorAll(sel) : [];
-                        for (var i = 0; i < matches.length; i++) matches[i].style.display = 'none';
+                        if (node.matches && node.matches(sel)) hideAd(node);
+                        if (!node.querySelectorAll) return;
+                        var matches = node.querySelectorAll(sel);
+                        for (var i = 0; i < matches.length; i++) hideAd(matches[i]);
                     });
                 });
             });
@@ -641,11 +642,20 @@
         if (document.body) globalAdObserver.observe(document.body, { childList: true, subtree: true });
     }
 
-    function removeSkipLimit() {
+    // Hiding is not enough: a display:none <audio>/<video> keeps playing the
+    // ad with no UI. Pause any media inside ad nodes too.
+    function hideAd(el) {
         try {
-            var proto = Object.getPrototypeOf(Object.getPrototypeOf(window));
-            if (proto && proto.hasOwnProperty('skip')) delete proto.skip;
-        } catch (e) {}
+            el.style.display = 'none';
+            var media = el.querySelectorAll ? el.querySelectorAll('audio, video') : [];
+            for (var i = 0; i < media.length; i++) {
+                try { media[i].pause(); } catch(e) {}
+                try { media[i].muted = true; } catch(e2) {}
+            }
+            if (el.tagName === 'AUDIO' || el.tagName === 'VIDEO') {
+                try { el.pause(); } catch(e3) {}
+            }
+        } catch(e) {}
     }
 
     // ===== Initialization =====
@@ -679,7 +689,6 @@
         patchAudioUrls();
         interceptAudioElements();
         blockAds();
-        removeSkipLimit();
         monitorPlayback();
 
         // Start proxy health check every 3 seconds
@@ -696,7 +705,6 @@
                     injectFallbackBadge();
                 }
                 blockAds();
-                removeSkipLimit();
                 patchAudioUrls();
                 interceptAudioElements();
             }

@@ -34,6 +34,19 @@ const HEADER_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of simultaneous client connections.
 const MAX_CONCURRENT: usize = 64;
 
+/// Concurrent upstream resolutions (lucida/saavn handshakes + polls). Bands
+/// the fan-out so one client can't turn into thousands of upstream requests.
+/// Released before the body streams — long tracks never hold a slot here.
+static RESOLVE_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(16));
+
+/// How long an in-flight stream may go without a single upstream byte before
+/// it is cut. Bounds a stalled transfer; healthy streams chunk continuously.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Grace period for in-flight streams after shutdown before teardown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// One shared client for the lightweight control calls (health/shutdown
 /// probes). Building a `Client` per call wastes a connection pool + TLS
 /// context every time `status`/`apply`/health-poll runs.
@@ -93,18 +106,22 @@ impl AudioProxy {
             PROXY_HOST, self.port
         );
 
+        // Tracked so shutdown drains in-flight streams instead of aborting
+        // them mid-chunk when the runtime tears down.
+        let mut tasks = tokio::task::JoinSet::new();
+
         loop {
             // Check the latched flag before each select: if a /shutdown arrived
             // in the window where no waiter was registered, the Notify alone
             // would be missed and the proxy would need a second /shutdown.
-            if self.shutting_down.load(Ordering::Relaxed) {
+            if self.shutting_down.load(Ordering::Acquire) {
                 break;
             }
 
             let (socket, _) = match tokio::select! {
                 _ = self.shutdown.notified() => break,
                 _ = tokio::signal::ctrl_c() => {
-                    self.shutting_down.store(true, Ordering::Relaxed);
+                    self.shutting_down.store(true, Ordering::Release);
                     break;
                 }
                 accepted = listener.accept() => accepted,
@@ -124,12 +141,11 @@ impl AudioProxy {
             let client = self.client.clone();
             let semaphore = self.semaphore.clone();
 
-            tokio::spawn(async move {
-                // Holds the permit for the whole connection. Fails only if the
-                // semaphore was closed during shutdown — then drop the conn.
-                let Ok(_permit) = semaphore.acquire().await else {
-                    return;
-                };
+            // No permit taken here on purpose: the request head is read and
+            // classified inside `handle_client`, and admin endpoints
+            // (/health, /shutdown) never take a permit — they stay
+            // responsive even when all 64 stream slots are busy.
+            tasks.spawn(async move {
                 if let Err(e) = handle_client(
                     socket,
                     current_track,
@@ -137,6 +153,7 @@ impl AudioProxy {
                     shutting_down,
                     shutdown,
                     client,
+                    semaphore,
                 )
                 .await
                 {
@@ -144,6 +161,12 @@ impl AudioProxy {
                 }
             });
         }
+
+        // Drain: refuse new bulk work, let in-flight streams finish briefly,
+        // then return (the runtime aborts whatever is left).
+        self.semaphore.close();
+        drop(listener);
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, tasks.join_all()).await;
 
         println!("[kebabify] Audio proxy stopped");
         Ok(())
@@ -205,6 +228,9 @@ impl AudioProxy {
 }
 
 /// Handles a single HTTP request to the proxy.
+///
+/// Lock order (never inverted anywhere): `current_track`, then
+/// `current_source`. Neither is ever held across network I/O.
 async fn handle_client(
     stream: tokio::net::TcpStream,
     current_track: Arc<Mutex<Option<String>>>,
@@ -212,6 +238,7 @@ async fn handle_client(
     shutting_down: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     client: reqwest::Client,
+    semaphore: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -342,7 +369,7 @@ async fn handle_client(
 
         // Set the latched flag BEFORE waking the accept loop: even if the
         // notifier is missed, the loop-top check breaks on the next iteration.
-        shutting_down.store(true, Ordering::Relaxed);
+        shutting_down.store(true, Ordering::Release);
         let body = serde_json::json!({"status": "stopping"}).to_string();
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -392,6 +419,17 @@ async fn handle_client(
         return Err(anyhow!("Could not extract a track ID from request"));
     };
 
+    // Bulk admission, fail-fast: when all stream slots are busy (or the
+    // server is draining), answer 503 instead of queueing behind minutes of
+    // audio. Admin endpoints never reach this point, so they stay live.
+    let _permit = match semaphore.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            write_busy(&mut write_half, origin.as_deref()).await?;
+            return Ok(());
+        }
+    };
+
     *current_track.lock().await = Some(tid.clone());
     println!("[kebabify] Track ID: {} — resolving upstream", tid);
 
@@ -409,8 +447,13 @@ async fn handle_client(
     let mut response_started = false;
     let result: Result<()> = async {
         // Primary: lucida FLAC. Fallback: Saavn 320kbps — a track playing in
-        // high quality beats a 502.
-        let (mut audio_resp, is_flac, source): (reqwest::Response, bool, &'static str) =
+        // high quality beats a 502. The resolve permit is scoped to this
+        // block: handshakes and polls are bounded, the body streams after.
+        let (mut audio_resp, is_flac, source): (reqwest::Response, bool, &'static str) = {
+            let _resolve_permit = RESOLVE_PERMITS
+                .acquire()
+                .await
+                .context("resolve pool shut down")?;
             match crate::lucida::open_stream(
                 &client,
                 &spotify_url,
@@ -443,7 +486,8 @@ async fn handle_client(
                         }
                     }
                 }
-            };
+            }
+        };
         *current_source.lock().await = Some(source);
 
         let default_type = if is_flac { "audio/flac" } else { "audio/mp4" };
@@ -506,9 +550,14 @@ async fn handle_client(
         if method == "HEAD" {
             println!("[kebabify] HEAD for track {} (headers only)", tid);
         } else {
-            // Stream the body.
+            // Stream the body. The idle timeout bounds a stalled upstream:
+            // healthy streams chunk continuously, so 60s without a byte
+            // means dead — cut it instead of holding the slot forever.
             let mut total_bytes: u64 = 0;
-            while let Some(chunk) = audio_resp.chunk().await? {
+            while let Some(chunk) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, audio_resp.chunk())
+                .await
+                .context("Upstream stalled mid-stream")??
+            {
                 write_half.write_all(&chunk).await?;
                 total_bytes += chunk.len() as u64;
             }
@@ -629,6 +678,27 @@ async fn write_bad_request<W: tokio::io::AsyncWrite + Unpin>(
     let body = serde_json::json!({"status": "error", "hint": hint}).to_string();
     let resp = format!(
         "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+        body.len(),
+        cors_header_line(origin),
+        body
+    );
+    write_half.write_all(resp.as_bytes()).await?;
+    write_half.flush().await?;
+    Ok(())
+}
+
+/// Writes a `503 Service Unavailable` JSON response when all stream slots
+/// are busy (or the server is draining). Fail-fast beats hanging: the player
+/// retries or falls back to native audio.
+async fn write_busy<W: tokio::io::AsyncWrite + Unpin>(
+    write_half: &mut W,
+    origin: Option<&str>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let body = serde_json::json!({"status": "busy", "hint": "proxy at capacity — retry shortly"})
+        .to_string();
+    let resp = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 2\r\nConnection: close{}\r\n\r\n{}",
         body.len(),
         cors_header_line(origin),
         body
@@ -875,6 +945,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cors_denies_unlisted_origin() {
+        // DNS-rebound evil.com must get no ACAO anywhere: neither readable
+        // errors nor usable preflights.
+        let mut output = Vec::new();
+        write_stream_error(&mut output, false, Some("https://evil.com"), "boom")
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("Access-Control-Allow-Origin"));
+
+        let mut output = Vec::new();
+        write_preflight(&mut output, Some("https://evil.com"))
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("Access-Control-Allow-Origin"));
+    }
+
+    #[tokio::test]
     async fn preflight_answers_no_content_with_cors() {
         let mut output = Vec::new();
         write_preflight(&mut output, Some("https://open.spotify.com"))
@@ -901,6 +992,16 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(text.contains("Access-Control-Allow-Origin: https://open.spotify.com\r\n"));
         assert!(text.contains("invalid track id"));
+    }
+
+    #[tokio::test]
+    async fn busy_answers_503_with_retry_after() {
+        let mut output = Vec::new();
+        write_busy(&mut output, None).await.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(text.contains("Retry-After: 2\r\n"));
+        assert!(text.contains("Access-Control-Allow-Origin: *\r\n"));
     }
 
     #[test]
