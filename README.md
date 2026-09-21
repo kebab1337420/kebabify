@@ -2,6 +2,8 @@
 
 Spicetify-like patcher for the Spotify desktop client: ad-free playback, lossless (FLAC) audio via the [lucida.to](https://lucida.to) API, and a small theme/extension bundle.
 
+**No PowerShell needed**: double-click `kebabify.exe` and pick an action from the menu (apply, supervised run, uninstall, status…).
+
 ## Requirements
 
 - Spotify desktop app (Windows)
@@ -12,19 +14,24 @@ Spicetify-like patcher for the Spotify desktop client: ad-free playback, lossles
 ```powershell
 kebabify.exe              # apply patches + launch Spotify (default)
 kebabify.exe apply        # same thing (aliases: patch, install)
+kebabify.exe run          # apply, launch Spotify supervised, stop the proxy when Spotify exits
 kebabify.exe status       # show patch status
 kebabify.exe update-ext   # re-inject theme + extension after an edit
 kebabify.exe uninstall    # restore Spotify originals (aliases: restore, remove)
 ```
+
+Pin `kebabify.exe run` instead of Spotify if you want the proxy to live exactly as long as Spotify (no lingering process, fresh proxy on every start). Ctrl+C stops the proxy but leaves Spotify playing.
 
 ## Unlock lossless audio (lucida.to)
 
 lucida.to sits behind a Cloudflare challenge, so the audio proxy needs browser cookies. Either:
 
 ```powershell
-kebabify.exe import-cookies            # opens Chrome on lucida.to — solve the challenge, cookies are captured automatically (alias: import)
+kebabify.exe import-cookies            # opens your browser on lucida.to — solve the challenge, cookies are captured automatically (alias: import)
 kebabify.exe cookie "<user-agent>" "cf_clearance=...; __cf_bm=..."   # manual paste (alias: cookies)
 ```
+
+`import-cookies` supports Chrome, Edge, Brave, Vivaldi, Opera, Arc (via DevTools) as well as Firefox, Zen, LibreWolf and Waterfox (via their cookie store) — first one found wins.
 
 Cookies are stored under `%APPDATA%\Kebabify\cookies.txt` and replayed on every lucida request. Override path with `KEBABIFY_COOKIES_PATH`. Note: that file holds live Cloudflare session cookies in plaintext — same exposure class as browser cookie jars, so don't share or commit it.
 

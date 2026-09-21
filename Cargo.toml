@@ -30,6 +30,9 @@ percent-encoding = "2"
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 
+# Firefox-family cookie store (cookies.sqlite) for the cookie import
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
 

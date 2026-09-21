@@ -464,6 +464,46 @@ fn set_config_extensions(ini: &str, name: &str, add: bool) -> String {
     }
 }
 
+/// Full path to the Spotify executable, for supervised launches (`run`).
+/// Falls back to `PATH` lookup; errors when nothing usable is found.
+pub fn spotify_exe_path() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe = find_spotify_install()?.join("Spotify.exe");
+        if exe.exists() {
+            return Ok(exe);
+        }
+        if let Ok(p) = which::which("spotify.exe") {
+            return Ok(p);
+        }
+        Err(anyhow!(
+            "Spotify.exe not found next to the install dir or on PATH"
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let exe = PathBuf::from("/Applications/Spotify.app/Contents/MacOS/Spotify");
+        if exe.exists() {
+            return Ok(exe);
+        }
+        Err(anyhow!("Spotify executable not found"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(p) = which::which("spotify") {
+            return Ok(p);
+        }
+        Err(anyhow!("Spotify executable not found on PATH"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err(anyhow!("Unsupported platform"))
+    }
+}
+
 /// Locates the Spotify installation directory.
 fn find_spotify_install() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]

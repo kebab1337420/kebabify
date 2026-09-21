@@ -1,11 +1,19 @@
 //! One-command Cloudflare cookie import for lucida.to.
 //!
-//! Spawns Chrome with a throwaway profile pointed at lucida.to, waits for the
-//! user to solve the Cloudflare challenge in that window, then reads the
-//! resulting cookies straight from the browser through the Chrome DevTools
-//! Protocol (`Network.getCookies`) and stores them with `lucida::save_cookies`.
-//! No copy/paste, no console spelunking. The User-Agent of the same tab is
-//! captured too, because Cloudflare pins `cf_clearance` to it.
+//! Spawns a browser with a throwaway profile pointed at lucida.to, waits for
+//! the user to solve the Cloudflare challenge in that window, then reads the
+//! resulting cookies and stores them with `lucida::save_cookies`. No
+//! copy/paste, no console spelunking.
+//!
+//! Two mechanisms, by browser family:
+//!
+//! - Chromium (Chrome, Edge, Brave, Vivaldi, Opera, Arc): straight from the
+//!   browser through the Chrome DevTools Protocol (`Network.getCookies`).
+//! - Firefox family (Firefox, Zen, LibreWolf, Waterfox): no CDP — the cookies
+//!   are read from the throwaway profile's `cookies.sqlite` instead.
+//!
+//! The User-Agent of the same browser is captured too, because Cloudflare
+//! pins `cf_clearance` to it.
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -76,7 +84,31 @@ impl Cdp {
 
 /// Main entry point for `kebabify import-cookies`.
 pub async fn import_from_browser() -> Result<()> {
-    let browser = find_browser().context("No Chrome or Edge installation found")?;
+    let found = find_browser().context(
+        "No supported browser found (Chrome, Edge, Brave, Vivaldi, Opera, Firefox, Zen, LibreWolf, Waterfox)",
+    )?;
+    match found.kind {
+        BrowserKind::Chromium => import_chromium(&found.exe).await,
+        BrowserKind::FirefoxFamily { label } => import_firefox(&found.exe, label).await,
+    }
+}
+
+/// A located browser executable and how to talk to it.
+struct FoundBrowser {
+    exe: PathBuf,
+    kind: BrowserKind,
+}
+
+#[derive(Clone, Copy)]
+enum BrowserKind {
+    /// DevTools Protocol (`Network.getCookies`).
+    Chromium,
+    /// Cookie store on disk (`cookies.sqlite`).
+    FirefoxFamily { label: &'static str },
+}
+
+/// Chromium path for `import-cookies` (CDP flow).
+async fn import_chromium(browser: &Path) -> Result<()> {
     let port = free_port().context("Could not reserve a debug port")?;
     let profile = temp_profile_dir()?;
     println!(
@@ -85,7 +117,7 @@ pub async fn import_from_browser() -> Result<()> {
     );
     println!("Solve the Cloudflare challenge in that window.");
 
-    let mut child = launch_browser(&browser, port, &profile)
+    let mut child = launch_browser(browser, port, &profile)
         .with_context(|| format!("Failed to launch {}", browser.display()))?;
 
     let ws_url = wait_for_page(port).await;
@@ -117,6 +149,156 @@ pub async fn import_from_browser() -> Result<()> {
     let _ = std::fs::remove_dir_all(&profile);
 
     result
+}
+
+/// Firefox-family path for `import-cookies`: no CDP here, so a throwaway
+/// profile is opened on lucida.to and its `cookies.sqlite` is polled until
+/// the challenge cookies land.
+async fn import_firefox(exe: &Path, label: &str) -> Result<()> {
+    let profile = temp_profile_dir()?;
+    println!(
+        "Opening a fresh {} window on lucida.to (throwaway profile)...",
+        label
+    );
+    println!("Solve the Cloudflare challenge in that window, then come back here.");
+
+    let mut child = std::process::Command::new(exe)
+        .arg("-profile")
+        .arg(&profile)
+        .arg("--no-remote")
+        .arg("https://lucida.to")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to launch {}", exe.display()))?;
+
+    // Cloudflare pins cf_clearance to the solving browser's UA: rebuild this
+    // binary's UA from its application.ini so the replay matches exactly.
+    let ua = firefox_user_agent(exe).with_context(|| {
+        format!(
+            "Could not determine the {} version (needed for its User-Agent)",
+            label
+        )
+    })?;
+
+    let result = async {
+        let header = poll_firefox_cookies(&profile).await?;
+        lucida::save_cookies(&ua, &header)?;
+        println!(
+            "Cookies stored in {}",
+            lucida::cookies_file_path().display()
+        );
+        println!("They will be replayed on all lucida.to requests.");
+        Ok(())
+    }
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&profile);
+
+    result
+}
+
+/// Polls the throwaway profile's cookie store until `cf_clearance` appears.
+async fn poll_firefox_cookies(profile: &Path) -> Result<String> {
+    let deadline = std::time::Instant::now() + CHALLENGE_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if let Some(header) = read_firefox_cookies(profile)? {
+            return Ok(header);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    Err(anyhow!(
+        "Timeout after {}s — the Cloudflare challenge was not completed in the browser window",
+        CHALLENGE_TIMEOUT.as_secs()
+    ))
+}
+
+/// Copies the profile's `cookies.sqlite` aside (the live file may be
+/// locked/WAL-mode) and returns the `Cookie` header value when it holds
+/// `cf_clearance`. `Ok(None)` = not there yet.
+fn read_firefox_cookies(profile: &Path) -> Result<Option<String>> {
+    let src = profile.join("cookies.sqlite");
+    if !src.exists() {
+        return Ok(None);
+    }
+    let scratch = profile.join("kebabify-cookies-copy.sqlite");
+    std::fs::copy(&src, &scratch).context("Failed to copy cookies.sqlite")?;
+    for suffix in ["-wal", "-shm"] {
+        let extra = profile.join(format!("cookies.sqlite{}", suffix));
+        if extra.exists() {
+            let _ = std::fs::copy(
+                &extra,
+                profile.join(format!("kebabify-cookies-copy.sqlite{}", suffix)),
+            );
+        }
+    }
+    let out = query_cookie_header(&scratch);
+    let _ = std::fs::remove_file(&scratch);
+    out
+}
+
+fn query_cookie_header(db: &Path) -> Result<Option<String>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("Failed to open cookies copy")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, value FROM moz_cookies WHERE host LIKE '%lucida.to' AND name IN ('cf_clearance', '__cf_bm', '__cfruid')",
+        )
+        .context("Failed to query cookies")?;
+    let mut rows = stmt.query([]).context("Failed to read cookies")?;
+    let mut pairs = Vec::new();
+    while let Some(row) = rows.next().context("Failed to read cookie row")? {
+        let name: String = row.get(0).context("Bad cookie row")?;
+        let value: String = row.get(1).context("Bad cookie row")?;
+        pairs.push((name, value));
+    }
+    if !pairs.iter().any(|(n, _)| n == "cf_clearance") {
+        return Ok(None);
+    }
+    Ok(Some(
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
+}
+
+/// Rebuilds this Firefox-family binary's User-Agent from its
+/// `application.ini` (`Version=` under `[App]`), e.g.
+/// `Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0`.
+/// Pure parser tested below; file IO stays in the caller.
+fn firefox_user_agent(exe: &Path) -> Result<String> {
+    let dir = exe.parent().context("Browser path has no parent dir")?;
+    let ini = std::fs::read_to_string(dir.join("application.ini"))
+        .context("Failed to read application.ini next to the browser")?;
+    firefox_ua_from_ini(&ini).ok_or_else(|| anyhow!("No Version= found in application.ini"))
+}
+
+fn firefox_ua_from_ini(ini: &str) -> Option<String> {
+    let mut in_app = false;
+    for line in ini.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_app = t.eq_ignore_ascii_case("[App]");
+            continue;
+        }
+        if in_app {
+            if let Some(v) = t.strip_prefix("Version=").map(str::trim) {
+                if !v.is_empty() {
+                    return Some(format!(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{}) Gecko/20100101 Firefox/{}",
+                        v, v
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Opens the CDP page, polls for the Cloudflare cookies, returns (UA, Cookie).
@@ -229,42 +411,130 @@ async fn wait_for_page(port: u16) -> Option<String> {
     None
 }
 
-fn find_browser() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
+/// Known install layouts: (relative path segments, exe file, kind).
+/// `None` env vars are skipped; the first existing layout wins, Chromium
+/// before Firefox-family (CDP is smoother than sqlite polling).
+fn known_browser_layouts() -> Vec<(Vec<&'static str>, &'static str, BrowserKind)> {
+    use BrowserKind::*;
+    vec![
+        // Chromium family (CDP).
+        (
+            vec!["Google", "Chrome", "Application"],
+            "chrome.exe",
+            Chromium,
+        ),
+        (
+            vec!["Microsoft", "Edge", "Application"],
+            "msedge.exe",
+            Chromium,
+        ),
+        (
+            vec!["BraveSoftware", "Brave-Browser", "Application"],
+            "brave.exe",
+            Chromium,
+        ),
+        (vec!["Vivaldi", "Application"], "vivaldi.exe", Chromium),
+        (vec!["Programs", "Opera"], "opera.exe", Chromium),
+        (vec!["Programs", "Opera GX"], "opera.exe", Chromium),
+        (vec!["Arc", "Application"], "arc.exe", Chromium),
+        // Firefox family (cookies.sqlite).
+        (
+            vec!["Mozilla Firefox"],
+            "firefox.exe",
+            FirefoxFamily { label: "Firefox" },
+        ),
+        (
+            vec!["Zen Browser"],
+            "zen.exe",
+            FirefoxFamily { label: "Zen" },
+        ),
+        (
+            vec!["LibreWolf"],
+            "librewolf.exe",
+            FirefoxFamily { label: "LibreWolf" },
+        ),
+        (
+            vec!["Waterfox"],
+            "waterfox.exe",
+            FirefoxFamily { label: "Waterfox" },
+        ),
+    ]
+}
+
+fn find_browser() -> Option<FoundBrowser> {
     for var in [
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
         "PROGRAMW6432",
         "LOCALAPPDATA",
     ] {
-        if let Some(dir) = std::env::var_os(var) {
-            let dir = PathBuf::from(dir);
-            candidates.push(
-                dir.join("Google")
-                    .join("Chrome")
-                    .join("Application")
-                    .join("chrome.exe"),
-            );
-            candidates.push(
-                dir.join("Microsoft")
-                    .join("Edge")
-                    .join("Application")
-                    .join("msedge.exe"),
-            );
+        let Some(root) = std::env::var_os(var) else {
+            continue;
+        };
+        let root = PathBuf::from(root);
+        for (segments, exe, kind) in known_browser_layouts() {
+            let mut path = root.clone();
+            for s in segments {
+                path = path.join(s);
+            }
+            let path = path.join(exe);
+            if path.exists() {
+                return Some(FoundBrowser { exe: path, kind });
+            }
         }
     }
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .or_else(find_browser_registry)
-        .or_else(|| which::which("chrome.exe").ok())
-        .or_else(|| which::which("msedge.exe").ok())
+    if let Some(exe) = find_browser_registry() {
+        return Some(exe);
+    }
+    // PATH fallback, Chromium first for the same CDP-first reason.
+    for name in [
+        "chrome",
+        "chromium",
+        "msedge",
+        "brave",
+        "vivaldi",
+        "opera",
+        "arc",
+        "firefox",
+        "zen",
+        "librewolf",
+        "waterfox",
+    ] {
+        if let Ok(path) = which::which(name) {
+            return Some(FoundBrowser {
+                kind: classify_exe(&path),
+                exe: path,
+            });
+        }
+    }
+    None
+}
+
+/// Best-effort kind from an exe file name (registry/PATH hits).
+fn classify_exe(path: &Path) -> BrowserKind {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if name.contains("firefox") {
+        BrowserKind::FirefoxFamily { label: "Firefox" }
+    } else if name.contains("zen") {
+        BrowserKind::FirefoxFamily { label: "Zen" }
+    } else if name.contains("librewolf") {
+        BrowserKind::FirefoxFamily { label: "LibreWolf" }
+    } else if name.contains("waterfox") {
+        BrowserKind::FirefoxFamily { label: "Waterfox" }
+    } else {
+        BrowserKind::Chromium
+    }
 }
 
 /// Windows: read the canonical path from the `App Paths` registry keys, which
-/// browsers register when installed (covers Chromium forks like Helium).
+/// browsers register when installed. Classified by exe name so Chromium forks
+/// (Helium…) and Firefox-family browsers resolve to the right import flow.
 #[cfg(target_os = "windows")]
-fn find_browser_registry() -> Option<PathBuf> {
+fn find_browser_registry() -> Option<FoundBrowser> {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
 
     const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths";
@@ -276,7 +546,18 @@ fn find_browser_registry() -> Option<PathBuf> {
         let Ok(app_paths) = root.open_subkey_with_flags(SUBKEY, KEY_READ) else {
             continue;
         };
-        for exe in ["chrome.exe", "msedge.exe"] {
+        for exe in [
+            "chrome.exe",
+            "msedge.exe",
+            "brave.exe",
+            "vivaldi.exe",
+            "opera.exe",
+            "arc.exe",
+            "firefox.exe",
+            "zen.exe",
+            "librewolf.exe",
+            "waterfox.exe",
+        ] {
             let Ok(key) = app_paths.open_subkey_with_flags(exe, KEY_READ) else {
                 continue;
             };
@@ -285,7 +566,10 @@ fn find_browser_registry() -> Option<PathBuf> {
             };
             let path = PathBuf::from(path);
             if path.exists() {
-                return Some(path);
+                return Some(FoundBrowser {
+                    kind: classify_exe(&path),
+                    exe: path,
+                });
             }
         }
     }
@@ -293,7 +577,7 @@ fn find_browser_registry() -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn find_browser_registry() -> Option<PathBuf> {
+fn find_browser_registry() -> Option<FoundBrowser> {
     None
 }
 
@@ -379,5 +663,81 @@ mod tests {
         assert!(response_cookies(&json!({"id": 1})).is_err());
         assert!(response_cookies(&json!({"result": {}})).is_err());
         assert!(response_cookies(&json!({"result": {"cookies": "nope"}})).is_err());
+    }
+
+    #[test]
+    fn exe_names_classified() {
+        assert!(matches!(
+            classify_exe(&PathBuf::from("C:\\x\\chrome.exe")),
+            BrowserKind::Chromium
+        ));
+        assert!(matches!(
+            classify_exe(&PathBuf::from("C:\\x\\brave.exe")),
+            BrowserKind::Chromium
+        ));
+        assert!(matches!(
+            classify_exe(&PathBuf::from("C:\\x\\firefox.exe")),
+            BrowserKind::FirefoxFamily { label: "Firefox" }
+        ));
+        assert!(matches!(
+            classify_exe(&PathBuf::from("C:\\x\\zen.exe")),
+            BrowserKind::FirefoxFamily { label: "Zen" }
+        ));
+    }
+
+    #[test]
+    fn firefox_ua_built_from_ini() {
+        let ini = "[App]\nVendor=Mozilla\nVersion=140.0\nBuildID=20260601\n";
+        assert_eq!(
+            firefox_ua_from_ini(ini).as_deref(),
+            Some(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
+            )
+        );
+        assert_eq!(firefox_ua_from_ini("[App]\nVendor=x\n"), None);
+        assert_eq!(firefox_ua_from_ini(""), None);
+    }
+
+    #[test]
+    fn firefox_cookies_filtered_like_cdp() {
+        let dir = std::env::temp_dir().join(format!("kebabify_sqlite_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("cookies.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE moz_cookies(name TEXT, value TEXT, host TEXT);
+                 INSERT INTO moz_cookies VALUES
+                   ('cf_clearance', 'abc', '.lucida.to'),
+                   ('sessionid', 'drop', '.lucida.to'),
+                   ('__cf_bm', 'def', '.lucida.to'),
+                   ('cf_clearance', 'other', '.example.com');",
+            )
+            .unwrap();
+        }
+        let header = query_cookie_header(&db).unwrap().unwrap();
+        assert!(header.contains("cf_clearance=abc"));
+        assert!(header.contains("__cf_bm=def"));
+        assert!(!header.contains("sessionid"));
+        assert!(!header.contains("other"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn firefox_cookies_missing_clearance_is_none() {
+        let dir =
+            std::env::temp_dir().join(format!("kebabify_sqlite_test2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("cookies.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE moz_cookies(name TEXT, value TEXT, host TEXT);
+                 INSERT INTO moz_cookies VALUES ('__cf_bm', 'def', '.lucida.to');",
+            )
+            .unwrap();
+        }
+        assert_eq!(query_cookie_header(&db).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
