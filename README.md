@@ -7,17 +7,18 @@ Spicetify-like patcher for the Spotify desktop client: ad-free playback, lossles
 ## Requirements
 
 - Spotify desktop app (Windows)
-- Chrome or Edge (only needed for `import-cookies`, to solve the lucida.to Cloudflare challenge once)
+- A supported browser, only for `import-cookies` (Chromium: Chrome, Edge, Brave, Vivaldi, Opera, Arc — Firefox family: Firefox, Zen, LibreWolf, Waterfox)
 
 ## Install & use
 
 ```powershell
-kebabify.exe              # apply patches + launch Spotify (default)
-kebabify.exe apply        # same thing (aliases: patch, install)
+kebabify.exe              # menu interactif (double-clic, pas de PowerShell)
+kebabify.exe apply        # patch + launch (aliases: patch, install)
 kebabify.exe run          # apply, launch Spotify supervised, stop the proxy when Spotify exits
 kebabify.exe status       # show patch status
 kebabify.exe update-ext   # re-inject theme + extension after an edit
 kebabify.exe uninstall    # restore Spotify originals (aliases: restore, remove)
+kebabify.exe import-cookies  # import Cloudflare cookies (alias: import)
 ```
 
 Pin `kebabify.exe run` instead of Spotify if you want the proxy to live exactly as long as Spotify (no lingering process, fresh proxy on every start). Ctrl+C stops the proxy but leaves Spotify playing.
@@ -40,7 +41,7 @@ While Spotify plays, the extension redirects audio requests to a local proxy on 
 ## Uninstall
 
 ```powershell
-kebabify.exe uninstall   # stops the proxy, restores originals, deletes backup dirs (clean-reinstall ready; cookies are kept)
+kebabify.exe uninstall   # stops the proxy, restores originals, deletes backup dirs + proxy log (clean-reinstall ready; cookies are kept)
 ```
 
 ## Develop

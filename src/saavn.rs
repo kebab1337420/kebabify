@@ -243,7 +243,10 @@ fn parse_embed_meta(html: &str) -> Option<TrackMeta> {
         .and_then(|a| a.get("name"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())?;
-    let duration_ms = entity.get("duration").and_then(|v| v.as_u64())?;
+    let duration_ms = entity
+        .get("duration")
+        .map(parse_saavn_duration)
+        .filter(|d| *d > 0)?;
     Some(TrackMeta {
         title: title.to_string(),
         artist: artist.to_string(),
@@ -252,13 +255,22 @@ fn parse_embed_meta(html: &str) -> Option<TrackMeta> {
 }
 
 /// Extracts the `__NEXT_DATA__` JSON blob from embed-page HTML.
+///
+/// Parsed as a *stream* from the tag end instead of substringing to the
+/// first `</script>`: a title containing that literal would otherwise cut
+/// the blob mid-JSON and fail the whole track.
 fn next_data_blob(html: &str) -> Option<&str> {
     let marker = "<script id=\"__NEXT_DATA__\"";
     let start = html.find(marker)?;
     let tag_end = html[start..].find('>')?;
     let content_start = start + tag_end + 1;
-    let content_end = html[content_start..].find("</script>")?;
-    Some(&html[content_start..content_start + content_end])
+    let rest = &html[content_start..];
+    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+    let consumed = match stream.next()? {
+        Ok(_) => stream.byte_offset(),
+        Err(_) => return None,
+    };
+    Some(&rest[..consumed])
 }
 
 /// Searches JioSaavn for `query` ("title artist").
@@ -502,16 +514,26 @@ fn decrypt_media_url(enc: &str) -> Result<String> {
     }
     data.truncate(data.len() - pad);
     let url = String::from_utf8(data).context("Saavn: decrypted URL is not UTF-8")?;
+    if url.is_empty() {
+        // A full padding block decrypts to "": never cache or serve that —
+        // every later call would reuse the poisoned entry.
+        return Err(anyhow!("Saavn: decrypted URL is empty"));
+    }
     Ok(upgrade_quality(&url))
 }
 
-/// Swaps a trailing low-quality marker (`…_96.mp4`) for `_320`. Trailing-only:
-/// a blind `replace` would also rewrite a hash/path segment that happens to
-/// contain `_96`. Without a known marker the URL is returned as-is (still
-/// playable, just not 320). Pure for tests.
+/// Swaps a trailing low-quality marker (`…_96.mp4`) for `_320`. Trailing-only
+/// on the path part: a blind `rfind` over the full URL would also rewrite a
+/// `_96` inside the query string (corrupting signed params) while leaving a
+/// low-quality path in place. Without a known marker the URL is returned
+/// as-is (still playable, just not 320). Pure for tests.
 fn upgrade_quality(url: &str) -> String {
-    match url.rfind("_96.") {
-        Some(pos) => format!("{}_320.{}", &url[..pos], &url[pos + 4..]),
+    let (head, tail) = match url.find(['?', '#']) {
+        Some(i) => url.split_at(i),
+        None => (url, ""),
+    };
+    match head.rfind("_96.") {
+        Some(pos) => format!("{}_320.{}{}", &head[..pos], &head[pos + 4..], tail),
         None => url.to_string(),
     }
 }
@@ -618,9 +640,35 @@ mod tests {
     #[test]
     fn cache_freshness() {
         assert!(cache_is_fresh(std::time::Instant::now()));
-        assert!(!cache_is_fresh(
-            std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_secs(1)
-        ));
+        // Instant - Duration panics on underflow (fresh-boot machines), so a
+        // stale instant is only asserted when representable.
+        if let Some(stale) =
+            std::time::Instant::now().checked_sub(CACHE_TTL + std::time::Duration::from_secs(1))
+        {
+            assert!(!cache_is_fresh(stale));
+        }
+    }
+
+    #[test]
+    fn quality_swap_ignores_query_string() {
+        assert_eq!(
+            upgrade_quality("https://x/song_96.mp4?tok=_96.xyz"),
+            "https://x/song_320.mp4?tok=_96.xyz"
+        );
+    }
+
+    #[test]
+    fn decrypt_empty_plaintext_rejected() {
+        // 8 bytes of 0x08: valid padding, empty plaintext — must not Ok("").
+        let enc = encrypt_media_url("");
+        assert!(decrypt_media_url(&enc).is_err());
+    }
+
+    #[test]
+    fn embed_with_script_in_title_parses() {
+        let html = r#"<html><head><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"title":"a</script><script>b","artists":[{"name":"C"}],"duration":200000}}}}}}</script></head></html>"#;
+        let m = parse_embed_meta(html).unwrap();
+        assert_eq!(m.title, "a</script><script>b");
     }
 
     use crate::mock::{MockServer, Route};

@@ -96,15 +96,41 @@ fn load_session() -> Option<CloudflareSession> {
     None
 }
 
+/// Cap on the cookies file read: only two short lines are ever used, so a
+/// multi-megabyte file (hostile or accidental) must not be fully allocated
+/// per track resolution.
+const MAX_COOKIES_READ: usize = 16 * 1024;
+
+/// Reads at most [`MAX_COOKIES_READ`] bytes as text, stopping at a character
+/// boundary (never panics on a split UTF-8 sequence).
+fn read_head(path: &std::path::Path, max: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let len = bytes.len().min(max);
+    match std::str::from_utf8(&bytes[..len]) {
+        Ok(s) => Some(s.to_string()),
+        // Cut mid-character: keep the longest valid prefix.
+        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()])
+            .ok()
+            .map(str::to_string),
+    }
+}
+
 fn read_session(path: &std::path::Path) -> Option<CloudflareSession> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_head(path, MAX_COOKIES_READ)?;
     let mut lines = text.lines();
-    let user_agent = lines.next()?.trim().to_string();
+    // A UTF-8 BOM (Notepad saves one) would otherwise poison the User-Agent
+    // with an invisible prefix and 403 every handshake.
+    let user_agent = strip_bom(lines.next()?.trim()).trim().to_string();
     let cookie = lines.next()?.trim().to_string();
     if user_agent.is_empty() || cookie.is_empty() {
         return None;
     }
     Some(CloudflareSession { user_agent, cookie })
+}
+
+/// Strips a UTF-8 byte-order mark left by editors like Notepad.
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{FEFF}').unwrap_or(s)
 }
 
 /// Persists a browser session for the lucida Cloudflare challenge.
@@ -117,7 +143,11 @@ pub fn save_cookies(user_agent: &str, cookie_header: &str) -> Result<()> {
     }
     std::fs::write(
         &path,
-        format!("{}\n{}\n", user_agent.trim(), cookie_header.trim()),
+        format!(
+            "{}\n{}\n",
+            strip_bom(user_agent.trim()),
+            strip_bom(cookie_header.trim())
+        ),
     )
     .context("Failed to write cookies file")?;
     // Live Cloudflare session: owner-only on Unix (Windows inherits the
@@ -169,11 +199,15 @@ pub fn has_cf_clearance() -> bool {
         .unwrap_or(false)
 }
 
-/// Checks a raw `Cookie` header value for the clearance cookie. Pure.
+/// Checks a raw `Cookie` header value for a usable clearance cookie: the
+/// `cf_clearance` name must carry a non-empty value (`cf_clearance` alone or
+/// `cf_clearance=` proves nothing and still 403s). Pure.
 pub fn cookie_has_clearance(cookie_header: &str) -> bool {
     cookie_header.split(';').any(|pair| {
-        let name = pair.split('=').next().unwrap_or("").trim();
-        name.eq_ignore_ascii_case("cf_clearance")
+        let Some((name, value)) = pair.split_once('=') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("cf_clearance") && !value.trim().is_empty()
     })
 }
 
@@ -606,6 +640,25 @@ mod tests {
         assert!(!cookie_has_clearance("__cf_bm=def; __cfruid=xyz"));
         assert!(!cookie_has_clearance(""));
         assert!(!cookie_has_clearance("not_cf_clearance=abc"));
+        // Name without value (or empty value) proves nothing.
+        assert!(!cookie_has_clearance("cf_clearance"));
+        assert!(!cookie_has_clearance("cf_clearance="));
+        assert!(!cookie_has_clearance("cf_clearance=; __cf_bm=x"));
+    }
+
+    #[test]
+    fn cookies_with_bom_and_oversize_load() {
+        let dir = std::env::temp_dir().join(format!("kebabify_bom_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // BOM + oversized junk after two valid lines: UA clean, tail cut.
+        let path = dir.join("cookies.txt");
+        let mut content = String::from("\u{FEFF}UA-1\ncf_clearance=abc\n");
+        content.push_str(&"x".repeat(100_000));
+        std::fs::write(&path, &content).unwrap();
+        let s = read_session(&path).expect("session should load");
+        assert_eq!(s.user_agent, "UA-1");
+        assert_eq!(s.cookie, "cf_clearance=abc");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

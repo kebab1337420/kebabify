@@ -40,7 +40,16 @@ impl SpotifyPatcher {
     pub fn uninstall_patches(&self) -> Result<()> {
         let backup_dir = self.get_backup_dir();
         if !backup_dir.exists() {
-            return Err(anyhow!("No backup found. Nothing to restore."));
+            // No backups: either already clean (idempotent success) or
+            // patches without backups (genuine problem). Tell apart via
+            // leftover markers.
+            if self.has_patch_markers() {
+                return Err(anyhow!(
+                    "No backup found, but patch markers remain — cannot restore safely"
+                ));
+            }
+            eprintln!("Already clean: no backups, no patch markers.");
+            return Ok(());
         }
 
         // Restore from backups
@@ -82,7 +91,7 @@ impl SpotifyPatcher {
         }
 
         // The index.html is already restored from backup above, but if the backup
-        // contains an old-style kebabify script tag, we need to remove it
+        // contains an old-style kebaccify script tag, we need to remove it
         let index_path = self.xpui_dir.join("index.html");
         if index_path.exists() {
             if let Ok(mut content) = std::fs::read_to_string(&index_path) {
@@ -157,6 +166,27 @@ impl SpotifyPatcher {
         Ok(())
     }
 
+    /// Whether any kebabify trace remains in the install (theme block, script
+    /// tag, or extension files, either naming). Used to tell "already clean"
+    /// from "backups lost" on uninstall without backups.
+    fn has_patch_markers(&self) -> bool {
+        let css = self.xpui_dir.join("user.css");
+        if let Ok(content) = std::fs::read_to_string(&css) {
+            if content.contains("kebabify_start") || content.contains("kebaccify_start") {
+                return true;
+            }
+        }
+        let index = self.xpui_dir.join("index.html");
+        if let Ok(content) = std::fs::read_to_string(&index) {
+            if content.contains("kebabify_ext") || content.contains("kebaccify_ext") {
+                return true;
+            }
+        }
+        ["kebabify_ext.js", "kebaccify_ext.js"]
+            .iter()
+            .any(|name| self.xpui_dir.join("ext").join(name).exists())
+    }
+
     fn get_backup_dir(&self) -> PathBuf {
         let legacy = self.spotify_dir.join(".kebaccify_backups");
         if legacy.exists() {
@@ -189,7 +219,8 @@ impl SpotifyPatcher {
 
     fn backup_files(&self) -> Result<()> {
         let backup_dir = self.get_backup_dir();
-        std::fs::create_dir_all(&backup_dir)?;
+        std::fs::create_dir_all(&backup_dir)
+            .with_context(|| format!("Failed to create backup dir {}", backup_dir.display()))?;
 
         // Only files that `apply_patches` actually modifies. Because backup
         // files are never overwritten once created, the first run always
@@ -217,7 +248,8 @@ impl SpotifyPatcher {
         let css = include_str!("kebabify_theme.css");
 
         let mut content = if css_path.exists() {
-            std::fs::read_to_string(&css_path)?
+            std::fs::read_to_string(&css_path)
+                .with_context(|| format!("Failed to read {}", css_path.display()))?
         } else {
             String::new()
         };
@@ -242,7 +274,8 @@ impl SpotifyPatcher {
     /// Inject JS extension into Spotify's index.html — inlined for reliability.
     fn inject_js_extensions(&self) -> Result<()> {
         let ext_dir = self.xpui_dir.join("ext");
-        std::fs::create_dir_all(&ext_dir)?;
+        std::fs::create_dir_all(&ext_dir)
+            .with_context(|| format!("Failed to create {}", ext_dir.display()))?;
 
         // Write the extension JS file
         let js = include_str!("kebabify_ext.js");
@@ -321,17 +354,24 @@ impl SpotifyPatcher {
         Ok(Some(extensions_dir))
     }
 
-    /// Remove the Spicetify registration (extension file + config entry).
+    /// Remove the Spicetify registration (extension file + config entry),
+    /// current and legacy names: a 0.3-era `kebaccify_ext.js` registration
+    /// must not survive an uninstall.
     fn unsync_spicetify_extension(&self) -> Result<()> {
         let Some(extensions_dir) = spicetify_extensions_dir() else {
             return Ok(());
         };
-        let _ = std::fs::remove_file(extensions_dir.join("kebabify_ext.js"));
+        for name in ["kebabify_ext.js", "kebaccify_ext.js"] {
+            let _ = std::fs::remove_file(extensions_dir.join(name));
+        }
 
-        let config_path = spicetify_config_path(&extensions_dir)?;
+        let Ok(config_path) = spicetify_config_path(&extensions_dir) else {
+            return Ok(());
+        };
         if config_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
-                let updated = set_config_extensions(&content, "kebabify_ext.js", false);
+                let mut updated = set_config_extensions(&content, "kebabify_ext.js", false);
+                updated = set_config_extensions(&updated, "kebaccify_ext.js", false);
                 if updated != content {
                     let _ = std::fs::write(&config_path, &updated);
                 }

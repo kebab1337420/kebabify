@@ -61,6 +61,10 @@ enum Commands {
         user_agent: String,
         /// Cookie header value, e.g. "cf_clearance=…; __cf_bm=…"
         cookie: String,
+        /// Overwrite even without cf_clearance (normally refused to protect
+        /// a working session from a bad paste)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Open a browser on lucida.to and import the Cloudflare cookies
@@ -147,16 +151,29 @@ async fn stop_proxy() {
 }
 
 /// Ensures a proxy instance: reuse a running one, else spawn detached and
-/// wait up to 5s for readiness. A proxy that never becomes ready is a
-/// warning, not a failure — Spotify still plays natively.
+/// wait up to 5s for readiness. A running proxy from an older release is
+/// restarted instead of reused forever (its fixes would never take effect).
+/// A proxy that never becomes ready is a warning, not a failure — Spotify
+/// still plays natively.
 async fn ensure_proxy() -> Result<()> {
     if audio_proxy::AudioProxy::is_running().await {
-        println!(
-            "Audio proxy already running on {}:{} — reusing it",
-            audio_proxy::PROXY_HOST,
-            audio_proxy::PROXY_PORT
-        );
-        return Ok(());
+        match audio_proxy::AudioProxy::proxy_version().await {
+            Some(v) if v == env!("CARGO_PKG_VERSION") => {
+                println!(
+                    "Audio proxy already running on {}:{} — reusing it",
+                    audio_proxy::PROXY_HOST,
+                    audio_proxy::PROXY_PORT
+                );
+                return Ok(());
+            }
+            other => {
+                println!(
+                    "Running proxy is stale or foreign (version {:?}) — restarting it...",
+                    other
+                );
+                stop_proxy().await;
+            }
+        }
     }
     // Start the FLAC audio proxy as a DETACHED process.
     // This is critical — if we use tokio::spawn, the proxy dies
@@ -181,7 +198,7 @@ async fn ensure_proxy() -> Result<()> {
         );
     } else {
         println!(
-            "Audio proxy failed to start within 5s on {}:{} — Spotify will launch anyway",
+            "Audio proxy failed to start within 5s on {}:{} — port may be busy (details in %APPDATA%\\Kebabify\\proxy.log) — Spotify will launch anyway",
             audio_proxy::PROXY_HOST,
             audio_proxy::PROXY_PORT
         );
@@ -233,6 +250,15 @@ async fn cmd_uninstall() -> Result<()> {
         }
         Err(e) => return Err(e),
     }
+    // The debug log is ours, not the user's: remove it for a clean
+    // reinstall. Cookies are kept — they cost a challenge to obtain.
+    if let Some(dir) = lucida::cookies_file_path().parent() {
+        let log = dir.join("proxy.log");
+        if log.exists() {
+            let _ = std::fs::remove_file(&log);
+            eprintln!("  Removed: proxy log");
+        }
+    }
     Ok(())
 }
 
@@ -264,7 +290,14 @@ async fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_cookie(user_agent: String, cookie: String) -> Result<()> {
+async fn cmd_cookie(user_agent: String, cookie: String, force: bool) -> Result<()> {
+    // Refuse to overwrite a working session with garbage: a paste without
+    // cf_clearance "succeeds" but still 403s on every track.
+    if !force && !lucida::cookie_has_clearance(&cookie) && lucida::has_cf_clearance() {
+        return Err(anyhow::anyhow!(
+            "no cf_clearance in there — refusing to overwrite the working session (re-run with --force to override)"
+        ));
+    }
     lucida::save_cookies(&user_agent, &cookie)?;
     println!("kebabify — Cloudflare cookies stored.");
     println!("The audio proxy will now use them on all lucida.to requests.");
@@ -279,8 +312,26 @@ async fn cmd_cookie(user_agent: String, cookie: String) -> Result<()> {
 }
 
 async fn cmd_import_cookies() -> Result<()> {
-    println!("kebabify — opening Chrome to capture the lucida.to cookies...");
+    println!("kebabify — opening a browser to capture the lucida.to cookies...");
     browser_import::import_from_browser().await
+}
+
+/// Manual cookie entry for the interactive menu: prompts for both lines.
+async fn cmd_cookie_prompt() -> Result<()> {
+    use std::io::{BufRead, Write};
+    print!("User-Agent du navigateur : ");
+    std::io::stdout().flush().ok();
+    let mut ua = String::new();
+    if std::io::stdin().lock().read_line(&mut ua).unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    print!("Valeur du header Cookie : ");
+    std::io::stdout().flush().ok();
+    let mut cookie = String::new();
+    if std::io::stdin().lock().read_line(&mut cookie).unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    cmd_cookie(ua.trim().to_string(), cookie.trim().to_string(), false).await
 }
 
 async fn cmd_apply() -> Result<()> {
@@ -363,6 +414,8 @@ enum MenuChoice {
     Uninstall,
     Status,
     UpdateExt,
+    ImportCookies,
+    CookieManual,
     Quit,
 }
 
@@ -375,6 +428,8 @@ fn parse_menu_choice(line: &str) -> Option<MenuChoice> {
         "d" | "desinstaller" | "désinstaller" | "uninstall" => Some(MenuChoice::Uninstall),
         "u" | "update" => Some(MenuChoice::UpdateExt),
         "s" | "statut" | "status" => Some(MenuChoice::Status),
+        "i" | "importer" | "import" | "import-cookies" => Some(MenuChoice::ImportCookies),
+        "c" | "cookie" | "manuel" => Some(MenuChoice::CookieManual),
         "q" | "quitter" | "quit" | "exit" => Some(MenuChoice::Quit),
         _ => None,
     }
@@ -392,6 +447,8 @@ async fn interactive_menu() -> Result<()> {
         println!("  [D]ésinstaller (restaurer Spotify)");
         println!("  [U]pdate extensions");
         println!("  [S]tatut");
+        println!("  [I]mporter les cookies (Cloudflare)");
+        println!("  [C]ookie manuel (coller UA + cookies)");
         println!("  [Q]uitter");
         print!("Choix > ");
         std::io::stdout().flush().ok();
@@ -401,7 +458,7 @@ async fn interactive_menu() -> Result<()> {
             break; // EOF (Ctrl+Z)
         }
         let Some(choice) = parse_menu_choice(&line) else {
-            println!("Choix inconnu, réessaie (A/R/D/U/S/Q).");
+            println!("Choix inconnu, réessaie (A/R/D/U/S/I/C/Q).");
             continue;
         };
         if choice == MenuChoice::Quit {
@@ -413,6 +470,8 @@ async fn interactive_menu() -> Result<()> {
             MenuChoice::Uninstall => cmd_uninstall().await,
             MenuChoice::Status => cmd_status().await,
             MenuChoice::UpdateExt => cmd_update_ext().await,
+            MenuChoice::ImportCookies => cmd_import_cookies().await,
+            MenuChoice::CookieManual => cmd_cookie_prompt().await,
             MenuChoice::Quit => unreachable!(),
         };
         if let Err(e) = result {
@@ -436,8 +495,12 @@ async fn main() -> Result<()> {
         Some(Commands::Uninstall) => cmd_uninstall().await?,
         Some(Commands::UpdateExt) => cmd_update_ext().await?,
         Some(Commands::Status) => cmd_status().await?,
-        Some(Commands::Cookie { user_agent, cookie }) => {
-            cmd_cookie(user_agent, cookie).await?;
+        Some(Commands::Cookie {
+            user_agent,
+            cookie,
+            force,
+        }) => {
+            cmd_cookie(user_agent, cookie, force).await?;
         }
         Some(Commands::ImportCookies) => cmd_import_cookies().await?,
         Some(Commands::AudioProxyOnly) => {
@@ -474,6 +537,8 @@ mod tests {
         assert_eq!(parse_menu_choice("DÉSINSTALLER"), Some(Uninstall));
         assert_eq!(parse_menu_choice("u"), Some(UpdateExt));
         assert_eq!(parse_menu_choice("s"), Some(Status));
+        assert_eq!(parse_menu_choice("i"), Some(ImportCookies));
+        assert_eq!(parse_menu_choice("c"), Some(CookieManual));
         assert_eq!(parse_menu_choice("q"), Some(Quit));
         assert_eq!(parse_menu_choice("quit"), Some(Quit));
         assert_eq!(parse_menu_choice(""), None);

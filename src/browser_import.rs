@@ -69,7 +69,12 @@ impl Cdp {
             match next {
                 Some(Ok(Message::Text(text))) => {
                     let msg: Value = serde_json::from_str(&text).context("Bad CDP response")?;
-                    if msg.get("id").and_then(Value::as_u64) == Some(id) {
+                    // Some endpoints echo the id back as a string: accept
+                    // both shapes instead of burning the full timeout.
+                    let matched = msg.get("id").is_some_and(|v| {
+                        v.as_u64() == Some(id) || v.as_str() == Some(id.to_string().as_str())
+                    });
+                    if matched {
                         return Ok(msg);
                     }
                     // Ignore events and other method responses.
@@ -202,10 +207,14 @@ async fn import_firefox(exe: &Path, label: &str) -> Result<()> {
 }
 
 /// Polls the throwaway profile's cookie store until `cf_clearance` appears.
+/// Transient store hiccups (AV scan, WAL checkpoint) skip the tick instead
+/// of aborting the whole 10-minute wait.
 async fn poll_firefox_cookies(profile: &Path) -> Result<String> {
     let deadline = std::time::Instant::now() + CHALLENGE_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if let Some(header) = read_firefox_cookies(profile)? {
+        // Absent or transiently unreadable: keep polling. Only the deadline
+        // aborts, never a single bad tick.
+        if let Ok(Some(header)) = read_firefox_cookies(profile) {
             return Ok(header);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -582,8 +591,12 @@ fn find_browser_registry() -> Option<FoundBrowser> {
 }
 
 fn free_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("Failed to bind a loopback port for browser debugging")?;
+    listener
+        .local_addr()
+        .context("Failed to read the bound debug port")
+        .map(|a| a.port())
 }
 
 fn temp_profile_dir() -> Result<PathBuf> {

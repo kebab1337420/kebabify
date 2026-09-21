@@ -76,7 +76,11 @@ pub struct AudioProxy {
 impl AudioProxy {
     pub fn new(port: u16) -> Self {
         let client = reqwest::Client::builder()
-            .user_agent("kebabify/0.1 (Spotify FLAC proxy)")
+            .user_agent(concat!(
+                "kebabify/",
+                env!("CARGO_PKG_VERSION"),
+                " (Spotify FLAC proxy)"
+            ))
             .connect_timeout(Duration::from_secs(10))
             // NOTE: no total .timeout() here — it would bound the full FLAC
             // body as well and cut long/slow streams mid-flight.
@@ -192,17 +196,16 @@ impl AudioProxy {
     }
 
     /// Returns `true` if a proxy instance is currently responding on the port.
+    /// Strict: the body must parse as our `/health` JSON with `"status":"ok"`,
+    /// so a foreign server squatting the port is never adopted as a proxy.
     pub async fn is_running() -> bool {
-        let url = format!("http://{}:{}/health", PROXY_HOST, PROXY_PORT);
-        match shared_client()
-            .get(&url)
-            .timeout(Duration::from_millis(400))
-            .send()
-            .await
-        {
-            Ok(r) => r.status().is_success(),
-            Err(_) => false,
-        }
+        proxy_health().await.is_some_and(|h| h.status_ok)
+    }
+
+    /// Reported `/health` version, if a real proxy answers. `None` covers
+    /// down, foreign, and ancient (pre-version-field) proxies.
+    pub async fn proxy_version() -> Option<String> {
+        proxy_health().await.and_then(|h| h.version)
     }
 
     /// Waits up to `timeout` for the proxy to answer `/health` at all
@@ -225,6 +228,34 @@ impl AudioProxy {
         }
         false
     }
+}
+
+/// Parsed `/health` state: liveness plus the serving binary's version.
+struct HealthState {
+    status_ok: bool,
+    version: Option<String>,
+}
+
+/// Fetches and parses `/health`. `None` on any failure or foreign body.
+async fn proxy_health() -> Option<HealthState> {
+    let url = format!("http://{}:{}/health", PROXY_HOST, PROXY_PORT);
+    let resp = shared_client()
+        .get(&url)
+        .timeout(Duration::from_millis(400))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    Some(HealthState {
+        status_ok: json.get("status").and_then(|v| v.as_str()) == Some("ok"),
+        version: json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
 }
 
 /// Handles a single HTTP request to the proxy.
@@ -250,7 +281,7 @@ async fn handle_client(
     // within the 8K cap can't hold a slot nearly forever. Loop until the blank
     // line: a request may arrive split over several TCP segments, and a single
     // read() would truncate Origin/Host.
-    let header_block = tokio::time::timeout(HEADER_TOTAL_TIMEOUT, async {
+    let header_block = match tokio::time::timeout(HEADER_TOTAL_TIMEOUT, async {
         let mut header_block = String::new();
         let mut line = String::new();
         loop {
@@ -273,10 +304,32 @@ async fn handle_client(
         Ok::<_, anyhow::Error>(header_block)
     })
     .await
-    .context("Timed out waiting for HTTP headers")??;
+    {
+        Ok(Ok(block)) => block,
+        // Unreadable head (timeout, oversize, non-UTF8, EOF): answer 400
+        // instead of dropping the connection silently — players report
+        // "bad request", not "connection reset".
+        _ => {
+            let _ = write_bad_request(&mut write_half, None, "malformed request head").await;
+            return Err(anyhow!("Malformed HTTP request head"));
+        }
+    };
 
     if header_block.is_empty() {
         return Ok(());
+    }
+
+    // Origin is needed for CORS even on error responses below.
+    let origin = request_origin(&header_block);
+
+    if has_conflicting_headers(&header_block) {
+        let _ = write_bad_request(
+            &mut write_half,
+            origin.as_deref(),
+            "conflicting duplicate headers",
+        )
+        .await;
+        return Err(anyhow!("Conflicting duplicate headers"));
     }
 
     // Parse the request line: "GET /path HTTP/1.1"
@@ -286,13 +339,14 @@ async fn handle_client(
         .unwrap_or("")
         .split_whitespace()
         .collect();
-    if parts.len() < 2 {
+    if parts.len() != 3 || !parts[2].starts_with("HTTP/") {
+        let _ =
+            write_bad_request(&mut write_half, origin.as_deref(), "malformed request line").await;
         return Err(anyhow!("Malformed HTTP request"));
     }
 
     let method = parts[0];
     let path = parts[1];
-    let origin = request_origin(&header_block);
     let endpoint = endpoint_for(method, path);
 
     // CORS preflight: Spotify's fetch() from xpui would otherwise be blocked
@@ -333,6 +387,9 @@ async fn handle_client(
             "track": track,
             "flac": source == "lucida",
             "source": source,
+            // Lets apply/run detect a stale detached proxy from an older
+            // release and restart it instead of reusing it forever.
+            "version": env!("CARGO_PKG_VERSION"),
         })
         .to_string();
 
@@ -392,6 +449,9 @@ async fn handle_client(
         let mut found_track_id = None;
         for param in query_str.split('&') {
             if let Some((k, v)) = param.split_once('=') {
+                // Strip a #fragment: clients may append one to an otherwise
+                // valid ID, and it must not fail validation.
+                let v = v.split('#').next().unwrap_or("");
                 if (k == "track" || k == "track_id" || k == "id" || k == "cid") && is_track_id(v) {
                     found_track_id = Some(v.to_string());
                     break;
@@ -405,7 +465,7 @@ async fn handle_client(
         let host = header_value(&header_block, "host")
             .unwrap_or_else(|| "audio-spclient.wg.spotify.com".to_string());
         let full_url = format!("https://{}{}", host, path);
-        println!("[kebabify] Proxy request: GET {}", full_url);
+        eprintln!("[kebabify] Proxy request: GET {}", full_url);
         extract_track_id(&full_url)
     };
 
@@ -431,7 +491,7 @@ async fn handle_client(
     };
 
     *current_track.lock().await = Some(tid.clone());
-    println!("[kebabify] Track ID: {} — resolving upstream", tid);
+    eprintln!("[kebabify] Track ID: {} — resolving upstream", tid);
 
     let spotify_url = format!("https://open.spotify.com/track/{}", tid);
 
@@ -548,7 +608,7 @@ async fn handle_client(
         // HEAD asks for metadata only: headers go out, the body stays home.
         // (Previously a HEAD streamed the whole track, violating HTTP.)
         if method == "HEAD" {
-            println!("[kebabify] HEAD for track {} (headers only)", tid);
+            eprintln!("[kebabify] HEAD for track {} (headers only)", tid);
         } else {
             // Stream the body. The idle timeout bounds a stalled upstream:
             // healthy streams chunk continuously, so 60s without a byte
@@ -563,7 +623,7 @@ async fn handle_client(
             }
 
             write_half.flush().await?;
-            println!(
+            eprintln!(
                 "[kebabify] Served {} for track {} ({} bytes)",
                 if is_flac {
                     "FLAC"
@@ -766,15 +826,38 @@ async fn write_forbidden<W: tokio::io::AsyncWrite + Unpin>(write_half: &mut W) -
 /// allocating per line (the old `to_lowercase().starts_with(..)` built a
 /// `String` for every header line on every request).
 fn header_value(header_block: &str, name: &str) -> Option<String> {
-    header_block.lines().find_map(|l| {
-        let (key, value) = l.split_once(':')?;
-        if key.trim().eq_ignore_ascii_case(name) {
-            let v = value.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
+    header_values(header_block, name)
+        .into_iter()
+        .next()
+        .map(str::to_string)
+}
+
+/// All values of a request header in order. Pure for tests.
+fn header_values<'a>(header_block: &'a str, name: &str) -> Vec<&'a str> {
+    header_block
+        .lines()
+        .filter_map(|l| {
+            let (key, value) = l.split_once(':')?;
+            if !key.trim().eq_ignore_ascii_case(name) {
+                return None;
             }
-        }
-        None
+            let v = value.trim();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        })
+        .collect()
+}
+
+/// Rejects requests whose security headers disagree with themselves: with
+/// first-wins parsing, a smuggled second `Origin`/`Range` would otherwise
+/// ride along unnoticed.
+fn has_conflicting_headers(header_block: &str) -> bool {
+    ["origin", "range", "if-range", "host"].iter().any(|name| {
+        let values = header_values(header_block, name);
+        values.iter().skip(1).any(|v| *v != values[0])
     })
 }
 
@@ -845,7 +928,9 @@ fn extract_track_id(url: &str) -> Option<String> {
     }
 
     // Manual fallback — look for track IDs near known keys.
-    // ("spotify:track:" is matched whole so "soundtrack:…" can't hit it.)
+    // ("spotify:track:" is matched whole so "soundtrack:…" can't hit it, and
+    // every other key needs a left delimiter so "?sid=<id>" (?valid=, …)
+    // doesn't match the "id=" inside it.)
     for key in &[
         "spotify:track:",
         "track/",
@@ -856,8 +941,18 @@ fn extract_track_id(url: &str) -> Option<String> {
     ] {
         let mut search_from = 0;
         while let Some(rel) = url[search_from..].find(key) {
-            let start = search_from + rel + key.len();
+            let key_at = search_from + rel;
+            let start = key_at + key.len();
             let rest = &url[start..];
+            let delimited = key_at == 0
+                || matches!(
+                    url[..key_at].chars().next_back(),
+                    Some('/' | '?' | '&' | '=' | ':' | '#' | ';')
+                );
+            if !delimited {
+                search_from = start.max(1);
+                continue;
+            }
             let mut id_end = 0;
             for (i, c) in rest.char_indices() {
                 if c.is_ascii_alphanumeric() {
@@ -1058,6 +1153,33 @@ mod tests {
     }
 
     #[test]
+    fn track_id_keys_need_left_delimiter() {
+        // "id=" inside "sid="/valid=, "track/" inside "soundtrack/" must not
+        // match — only delimited keys count.
+        assert_eq!(
+            extract_track_id(&format!("https://x/?sid={}", TRACK_ID)),
+            None
+        );
+        assert_eq!(
+            extract_track_id(&format!("https://x/?valid={}", TRACK_ID)),
+            None
+        );
+        assert_eq!(
+            extract_track_id(&format!("https://x/soundtrack/{}", TRACK_ID)),
+            None
+        );
+        // Delimited forms still work.
+        assert_eq!(
+            extract_track_id(&format!("https://x/?track_id={}", TRACK_ID)),
+            Some(TRACK_ID.to_string())
+        );
+        assert_eq!(
+            extract_track_id(&format!("https://x/a/track/{}", TRACK_ID)),
+            Some(TRACK_ID.to_string())
+        );
+    }
+
+    #[test]
     fn track_id_rejects_short_fragments() {
         assert_eq!(
             extract_track_id("https://open.spotify.com/track?id=abc"),
@@ -1117,7 +1239,19 @@ mod tests {
             Some("https://open.spotify.com")
         );
         assert_eq!(request_range(block).as_deref(), Some("bytes=0-1023"));
+        assert_eq!(request_if_range(block), None);
         assert_eq!(request_origin("GET / HTTP/1.1\r\n\r\n"), None);
         assert_eq!(request_range("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn duplicate_security_headers_rejected() {
+        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
+        assert!(!has_conflicting_headers(same_twice));
+        let conflict = "GET / HTTP/1.1\r\nOrigin: https://evil.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
+        assert!(has_conflicting_headers(conflict));
+        let ranges = "GET / HTTP/1.1\r\nRange: bytes=0-1\r\nRange: bytes=2-3\r\n\r\n";
+        assert!(has_conflicting_headers(ranges));
+        assert!(!has_conflicting_headers("GET / HTTP/1.1\r\n\r\n"));
     }
 }

@@ -2,11 +2,12 @@
 name = "kebabify"
 version = "0.4.0"
 edition = "2021"
-authors = ["Alaric <alaric@kebaccify.dev>"]
+authors = ["kebab1337420"]
 description = "Spicetify-like extension for Spotify: ad-free, lossless audio via lucida.to API with JioSaavn fallback"
 license = "MIT"
 repository = "https://github.com/kebab1337420/kebabify"
 readme = "README.md"
+exclude = ["icons/*"]
 
 [dependencies]
 # Async runtime
