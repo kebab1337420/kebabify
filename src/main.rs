@@ -111,9 +111,9 @@ async fn main() -> Result<()> {
                     p.uninstall_patches()?;
                     println!("Patches removed. Spotify restored to original.");
                 }
-                Err(e) => {
-                    println!("Warning: {}", e);
-                }
+                // Fail the process (exit 1) instead of swallowing: scripts
+                // must be able to tell a failed uninstall from a clean one.
+                Err(e) => return Err(e),
             }
         }
         Some(Commands::UpdateExt) => {
@@ -123,9 +123,7 @@ async fn main() -> Result<()> {
                     p.update_extensions()?;
                     println!("Extensions updated.");
                 }
-                Err(e) => {
-                    println!("Error: {}", e);
-                }
+                Err(e) => return Err(e),
             }
         }
         Some(Commands::Status) => match patcher {
@@ -134,10 +132,11 @@ async fn main() -> Result<()> {
                 print_runtime_state().await;
             }
             Err(e) => {
-                println!("Spotify not found: {}", e);
                 // The proxy and cookies live outside the Spotify install —
-                // report them anyway (e.g. proxy left running after uninstall).
+                // report them anyway (e.g. proxy left running after uninstall),
+                // then fail the process so scripts see the missing install.
                 print_runtime_state().await;
+                return Err(e);
             }
         },
         Some(Commands::Cookie { user_agent, cookie }) => {
@@ -185,7 +184,7 @@ async fn main() -> Result<()> {
                         // Start the FLAC audio proxy as a DETACHED process.
                         // This is critical — if we use tokio::spawn, the proxy dies
                         // when main() returns. Instead we launch a separate kebabify.exe
-                        // process with the --audio-proxy-only flag that lives independently.
+                        // process with the audio-proxy-only subcommand that lives independently.
                         let exe =
                             std::env::current_exe().context("Cannot find kebabify.exe path")?;
                         let mut cmd = std::process::Command::new(&exe);
@@ -238,10 +237,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    // Spotify not found — show error but still let the user know
-                    println!("Error: {}", e);
-                    println!("kebabify requires Spotify to be installed.");
-                    println!("Please install Spotify from https://spotify.com/download");
+                    // Spotify not found — fail the process (exit 1) instead of
+                    // printing success-looking lines.
+                    return Err(e.context("kebabify requires Spotify to be installed"));
                 }
             }
         }

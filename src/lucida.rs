@@ -120,6 +120,14 @@ pub fn save_cookies(user_agent: &str, cookie_header: &str) -> Result<()> {
         format!("{}\n{}\n", user_agent.trim(), cookie_header.trim()),
     )
     .context("Failed to write cookies file")?;
+    // Live Cloudflare session: owner-only on Unix (Windows inherits the
+    // per-user %APPDATA% ACL, so nothing to do there).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to restrict cookies file permissions")?;
+    }
     Ok(())
 }
 
@@ -175,6 +183,10 @@ pub const LUCIDA_API_LOAD: &str = "https://lucida.to/api/load?url=%2Fapi%2Ffetch
 /// Number of status polls before giving up.
 const MAX_POLLS: u32 = 30;
 
+/// Consecutive transport failures (DNS/TLS/refused) that abort polling early
+/// instead of burning all 30 polls when the network itself is down.
+const MAX_TRANSPORT_ERRORS: u32 = 3;
+
 /// Interval between status polls.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -195,19 +207,45 @@ pub struct LucidaStream {
     pub response: reqwest::Response,
 }
 
+/// Builds the status + download URLs from the API's `server`/`handoff`.
+/// Both come from the network, so both are validated: `server` becomes a DNS
+/// label and `handoff` a path segment — anything else is rejected instead of
+/// being interpolated into a request URL. Pure for tests.
+fn status_urls(server: &str, handoff: &str) -> Result<(String, String)> {
+    let server_ok = !server.is_empty()
+        && server
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !server_ok {
+        return Err(anyhow!("lucida API returned a bad server name"));
+    }
+    let handoff_ok = !handoff.is_empty()
+        && handoff
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.~".contains(&b));
+    if !handoff_ok {
+        return Err(anyhow!("lucida API returned a bad handoff ID"));
+    }
+    let status_url = format!("https://{}.lucida.to/api/fetch/request/{}", server, handoff);
+    let download_url = format!("{}/download", status_url);
+    Ok((status_url, download_url))
+}
+
 /// Resolves a Spotify track URL through lucida.to and returns a streaming
 /// response ready to be relayed downstream.
 ///
 /// Steps: resolve page → extract CSRF token → request stream → poll status
 /// until ready → open the download endpoint.
 ///
-/// `range` is optional (`bytes=START-END`): when provided it is forwarded to
-/// the download endpoint so seekable clients get a `206 Partial Content` with
-/// `Content-Range`, which is what re-enables seeking in the Spotify player.
+/// `range`/`if_range` are optional (`bytes=START-END` + validator): when
+/// provided they are forwarded to the download endpoint so seekable clients
+/// get a `206 Partial Content` with `Content-Range`, which is what re-enables
+/// seeking in the Spotify player.
 pub async fn open_stream(
     client: &reqwest::Client,
     spotify_url: &str,
     range: Option<&str>,
+    if_range: Option<&str>,
 ) -> Result<LucidaStream> {
     // Load the captured browser session (UA + Cloudflare cookies) once, so the
     // user can rotate cookies and re-open a stream without restarting.
@@ -276,15 +314,11 @@ pub async fn open_stream(
 
     let handoff = dl.get("handoff").and_then(|v| v.as_str()).unwrap_or("");
     let server = dl.get("server").and_then(|v| v.as_str()).unwrap_or("api");
-    if handoff.is_empty() {
-        return Err(anyhow!("lucida API returned no handoff ID"));
-    }
+    let (status_url, download_url) = status_urls(server, handoff)?;
 
     // Step 3: poll until the track is ready to stream.
-    let status_url = format!("https://{}.lucida.to/api/fetch/request/{}", server, handoff);
-    let download_url = format!("{}/download", status_url);
-
     let mut ready = false;
+    let mut transport_errors = 0u32;
     for _ in 0..MAX_POLLS {
         match identify(client.get(&status_url), session.as_ref())
             .timeout(STATUS_TIMEOUT)
@@ -292,6 +326,7 @@ pub async fn open_stream(
             .await
         {
             Ok(resp) if resp.status().is_success() => {
+                transport_errors = 0;
                 if let Ok(status_json) = resp.json::<serde_json::Value>().await {
                     let status = status_json
                         .get("status")
@@ -303,7 +338,21 @@ pub async fn open_stream(
                     }
                 }
             }
-            _ => {}
+            Ok(_) => {
+                // Server answered with an error status: alive but unhappy —
+                // keep polling, the track may still resolve.
+            }
+            Err(_) => {
+                // Transport failure (DNS/TLS/refused): the network itself is
+                // down, not the track — fail fast instead of burning polls.
+                transport_errors += 1;
+                if transport_errors >= MAX_TRANSPORT_ERRORS {
+                    return Err(anyhow!(
+                        "lucida unreachable (network error {}× in a row)",
+                        transport_errors
+                    ));
+                }
+            }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -316,6 +365,9 @@ pub async fn open_stream(
     let mut audio_req = identify(client.get(&download_url), session.as_ref());
     if let Some(r) = range {
         audio_req = audio_req.header("Range", r);
+    }
+    if let Some(v) = if_range {
+        audio_req = audio_req.header("If-Range", v);
     }
     let audio_resp = audio_req
         .send()
@@ -433,6 +485,23 @@ pub mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_urls_validated() {
+        let (s, d) = status_urls("s1", "abc-123_XY").unwrap();
+        assert_eq!(s, "https://s1.lucida.to/api/fetch/request/abc-123_XY");
+        assert_eq!(
+            d,
+            "https://s1.lucida.to/api/fetch/request/abc-123_XY/download"
+        );
+        assert!(status_urls("", "abc").is_err());
+        assert!(status_urls("api", "").is_err());
+        assert!(status_urls("evil.com", "abc").is_err());
+        assert!(status_urls("a/b", "abc").is_err());
+        assert!(status_urls("api", "../x").is_err());
+        assert!(status_urls("api", "a b").is_err());
+        assert!(status_urls("api", "a?b").is_err());
+    }
 
     #[test]
     fn csrf_token_extracted() {

@@ -94,7 +94,10 @@ fn cookies_file() -> PathBuf {
     std::env::var("APPDATA")
         .ok()
         .map(|a| PathBuf::from(a).join("Kebabify").join("cookies.txt"))
-        .unwrap_or(PathBuf::from("cookies.txt"))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kebabify").join("cookies.txt"))
+        })
+        .unwrap_or(PathBuf::from("kebabify_cookies.txt"))
 }
 
 fn free_port() -> Result<u16> {
@@ -110,7 +113,8 @@ fn launch_browser(browser: &PathBuf, port: u16, url: &str) -> Result<Child> {
                 "--user-data-dir={}",
                 std::env::temp_dir().join("kebabify-cap").display()
             ),
-            "--remote-allow-origins=*",
+            // Same least-privilege rule as the real importer: loopback only.
+            &format!("--remote-allow-origins=http://127.0.0.1:{port}"),
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-session-crashed-bubble",

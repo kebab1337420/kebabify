@@ -289,21 +289,29 @@ impl SpotifyPatcher {
             .with_context(|| format!("Failed to write Spicetify extension at {}", dst.display()))?;
 
         // Register in config-xpui.ini under [AdditionalOptions] extensions.
+        // A missing config (deleted/portable Spicetify) must not fail the
+        // whole apply — the CSS/JS are already injected; warn and continue
+        // like unsync does.
         let config_path = spicetify_config_path(&extensions_dir)?;
-        let content = std::fs::read_to_string(&config_path).with_context(|| {
-            format!(
-                "Failed to read Spicetify config at {}",
-                config_path.display()
-            )
-        })?;
-        let updated = set_config_extensions(&content, "kebabify_ext.js", true);
-        if updated != content {
-            std::fs::write(&config_path, &updated).with_context(|| {
-                format!(
-                    "Failed to write Spicetify config at {}",
-                    config_path.display()
-                )
-            })?;
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                let updated = set_config_extensions(&content, "kebabify_ext.js", true);
+                if updated != content {
+                    std::fs::write(&config_path, &updated).with_context(|| {
+                        format!(
+                            "Failed to write Spicetify config at {}",
+                            config_path.display()
+                        )
+                    })?;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "  Warning: Spicetify config unreadable at {} ({}) — extension file written but not registered",
+                    config_path.display(),
+                    e
+                );
+            }
         }
 
         eprintln!(
@@ -498,7 +506,9 @@ fn find_spotify_install() -> Result<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = PathBuf::from("/Applications/Spotify.app");
+        // Client files live under Contents/Resources, so point spotify_dir
+        // there and the shared join("Apps").join("xpui") below is correct.
+        let path = PathBuf::from("/Applications/Spotify.app/Contents/Resources");
         if path.exists() {
             return Ok(path);
         }

@@ -19,11 +19,30 @@ pub const PROXY_HOST: &str = "127.0.0.1";
 /// Port the proxy listens on. Keep in sync with the JS extension constant.
 pub const PROXY_PORT: u16 = 18900;
 
+/// The only Origin allowed to drive `/shutdown` — and the loopback identity
+/// echoed back for CORS on admin endpoints. A const (not `format!`) so the
+/// per-request checks allocate nothing.
+pub const SHUTDOWN_ORIGIN: &str = "http://127.0.0.1:18900";
+
 /// How long to wait for the HTTP request line before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Total budget for the whole request-head read: per-line timeouts alone let
+/// a slow sender hold a connection slot nearly forever within the 8K cap.
+const HEADER_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum number of simultaneous client connections.
 const MAX_CONCURRENT: usize = 64;
+
+/// One shared client for the lightweight control calls (health/shutdown
+/// probes). Building a `Client` per call wastes a connection pool + TLS
+/// context every time `status`/`apply`/health-poll runs.
+static SHARED_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
+fn shared_client() -> reqwest::Client {
+    SHARED_CLIENT.clone()
+}
 
 pub struct AudioProxy {
     port: u16,
@@ -133,11 +152,10 @@ impl AudioProxy {
     /// Sends a shutdown request to a running proxy instance.
     pub async fn request_shutdown() -> Result<()> {
         let url = format!("http://{}:{}/shutdown", PROXY_HOST, PROXY_PORT);
-        let client = reqwest::Client::new();
-        let resp = client
+        let resp = shared_client()
             .get(&url)
             .timeout(Duration::from_secs(3))
-            .header("Origin", format!("http://{}:{}", PROXY_HOST, PROXY_PORT))
+            .header("Origin", SHUTDOWN_ORIGIN)
             .send()
             .await
             .context("Failed to contact audio proxy for shutdown")?;
@@ -153,8 +171,7 @@ impl AudioProxy {
     /// Returns `true` if a proxy instance is currently responding on the port.
     pub async fn is_running() -> bool {
         let url = format!("http://{}:{}/health", PROXY_HOST, PROXY_PORT);
-        let client = reqwest::Client::new();
-        match client
+        match shared_client()
             .get(&url)
             .timeout(Duration::from_millis(400))
             .send()
@@ -169,7 +186,7 @@ impl AudioProxy {
     /// (readiness after spawn — any status counts, the port is bound).
     pub async fn wait_until_ready(timeout: Duration) -> bool {
         let url = format!("http://{}:{}/health", PROXY_HOST, PROXY_PORT);
-        let client = reqwest::Client::new();
+        let client = shared_client();
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             if client
@@ -201,29 +218,35 @@ async fn handle_client(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 
-    // Read the request head (request line + headers) with a timeout — a client
-    // that connects and sends nothing must not hold a task open forever (local
-    // DoS). Loop until the blank line: a request may arrive split over several
-    // TCP segments, and a single read() would truncate Origin/Host.
-    let mut header_block = String::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = tokio::time::timeout(READ_TIMEOUT, reader.read_line(&mut line))
-            .await
-            .context("Timed out waiting for HTTP request")?
-            .context("Failed to read HTTP request")?;
-        if n == 0 {
-            break;
+    // Read the request head (request line + headers). Two budgets: 5s per line
+    // so a stalled sender is cut, plus 10s total so thousands of tiny lines
+    // within the 8K cap can't hold a slot nearly forever. Loop until the blank
+    // line: a request may arrive split over several TCP segments, and a single
+    // read() would truncate Origin/Host.
+    let header_block = tokio::time::timeout(HEADER_TOTAL_TIMEOUT, async {
+        let mut header_block = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = tokio::time::timeout(READ_TIMEOUT, reader.read_line(&mut line))
+                .await
+                .context("Timed out waiting for HTTP request")?
+                .context("Failed to read HTTP request")?;
+            if n == 0 {
+                break;
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            header_block.push_str(&line);
+            if header_block.len() > 8192 {
+                return Err(anyhow!("Request headers too large"));
+            }
         }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        header_block.push_str(&line);
-        if header_block.len() > 8192 {
-            return Err(anyhow!("Request headers too large"));
-        }
-    }
+        Ok::<_, anyhow::Error>(header_block)
+    })
+    .await
+    .context("Timed out waiting for HTTP headers")??;
 
     if header_block.is_empty() {
         return Ok(());
@@ -250,6 +273,18 @@ async fn handle_client(
     if endpoint == Endpoint::Preflight {
         write_preflight(&mut write_half, origin.as_deref()).await?;
         return Ok(());
+    }
+
+    // Only GET serves content here: anything else (POST/PUT/…) is a client
+    // bug or a probe — answer 400 instead of treating it as audio.
+    if method != "GET" {
+        write_bad_request(
+            &mut write_half,
+            origin.as_deref(),
+            "unsupported HTTP method",
+        )
+        .await?;
+        return Err(anyhow!("Unsupported HTTP method: {}", method));
     }
 
     // ===== Admin endpoints =====
@@ -324,24 +359,23 @@ async fn handle_client(
     // The JS sends us ?track=TRACKID, or the original Spotify URL.
     // The query value is validated like any other source: an unchecked
     // `track=` would otherwise build bogus open.spotify.com/track/… URLs.
+    // Same key set as `extract_track_id` so direct and proxified URLs agree.
     let track_id: Option<String> = if let Some(qpos) = path.find('?') {
         let query_str = &path[qpos + 1..];
         let mut found_track_id = None;
         for param in query_str.split('&') {
-            let kv: Vec<&str> = param.splitn(2, '=').collect();
-            if kv.len() == 2 && kv[0] == "track" && is_track_id(kv[1]) {
-                found_track_id = Some(kv[1].to_string());
-                break;
+            if let Some((k, v)) = param.split_once('=') {
+                if (k == "track" || k == "track_id" || k == "id" || k == "cid") && is_track_id(v) {
+                    found_track_id = Some(v.to_string());
+                    break;
+                }
             }
         }
         found_track_id
     } else if path.starts_with("http") || path.contains("spotify") {
         extract_track_id(path)
     } else {
-        let host = header_block
-            .lines()
-            .find(|l| l.to_lowercase().starts_with("host:"))
-            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+        let host = header_value(&header_block, "host")
             .unwrap_or_else(|| "audio-spclient.wg.spotify.com".to_string());
         let full_url = format!("https://{}{}", host, path);
         println!("[kebabify] Proxy request: GET {}", full_url);
@@ -349,7 +383,12 @@ async fn handle_client(
     };
 
     let Some(tid) = track_id else {
-        write_bad_request(&mut write_half, origin.as_deref()).await?;
+        write_bad_request(
+            &mut write_half,
+            origin.as_deref(),
+            "missing or invalid track id",
+        )
+        .await?;
         return Err(anyhow!("Could not extract a track ID from request"));
     };
 
@@ -361,7 +400,9 @@ async fn handle_client(
     // Optional Range header — forwarded so the player can seek. When lucida's
     // download endpoint honors it (206 + Content-Range) the player gets real
     // byte-range seeking; when it doesn't (200 full body) behavior is unchanged.
+    // If-Range rides along so conditional seeks stay conditional.
     let range_header = request_range(&header_block);
+    let if_range_header = request_if_range(&header_block);
 
     // Resolve and stream inside a block: whatever happens, the indicator is
     // reset afterwards so /health never reports a ghost track.
@@ -370,7 +411,13 @@ async fn handle_client(
         // Primary: lucida FLAC. Fallback: Saavn 320kbps — a track playing in
         // high quality beats a 502.
         let (mut audio_resp, is_flac, source): (reqwest::Response, bool, &'static str) =
-            match crate::lucida::open_stream(&client, &spotify_url, range_header.as_deref()).await
+            match crate::lucida::open_stream(
+                &client,
+                &spotify_url,
+                range_header.as_deref(),
+                if_range_header.as_deref(),
+            )
+            .await
             {
                 Ok(s) => (s.response, true, "lucida"),
                 Err(lucida_err) => {
@@ -378,7 +425,14 @@ async fn handle_client(
                         "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
                         tid, lucida_err
                     );
-                    match crate::saavn::open_stream(&client, &tid, range_header.as_deref()).await {
+                    match crate::saavn::open_stream(
+                        &client,
+                        &tid,
+                        range_header.as_deref(),
+                        if_range_header.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(s) => (s.response, false, "saavn"),
                         Err(saavn_err) => {
                             return Err(anyhow!(
@@ -422,10 +476,10 @@ async fn handle_client(
             status.canonical_reason().unwrap_or("OK")
         );
         let mut response_header = format!(
-            "{}\r\nContent-Type: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: {}",
+            "{}\r\nContent-Type: {}\r\nConnection: close\r\nCache-Control: no-cache{}",
             status_line,
             content_type,
-            cors_allow_origin(origin.as_deref())
+            cors_header_line(origin.as_deref())
         );
         for name in ["content-range", "accept-ranges", "content-length"] {
             if let Some(v) = audio_resp.headers().get(name) {
@@ -447,28 +501,45 @@ async fn handle_client(
             .await
             .map_err(|e| anyhow!("Failed to flush headers: {}", e))?;
 
-        // Stream the body.
-        let mut total_bytes: u64 = 0;
-        while let Some(chunk) = audio_resp.chunk().await? {
-            write_half.write_all(&chunk).await?;
-            total_bytes += chunk.len() as u64;
-        }
+        // HEAD asks for metadata only: headers go out, the body stays home.
+        // (Previously a HEAD streamed the whole track, violating HTTP.)
+        if method == "HEAD" {
+            println!("[kebabify] HEAD for track {} (headers only)", tid);
+        } else {
+            // Stream the body.
+            let mut total_bytes: u64 = 0;
+            while let Some(chunk) = audio_resp.chunk().await? {
+                write_half.write_all(&chunk).await?;
+                total_bytes += chunk.len() as u64;
+            }
 
-        write_half.flush().await?;
-        println!(
-            "[kebabify] Served {} for track {} ({} bytes)",
-            if is_flac { "FLAC" } else { "AAC-320 (saavn fallback)" },
-            tid,
-            total_bytes
-        );
+            write_half.flush().await?;
+            println!(
+                "[kebabify] Served {} for track {} ({} bytes)",
+                if is_flac {
+                    "FLAC"
+                } else {
+                    "AAC-320 (saavn fallback)"
+                },
+                tid,
+                total_bytes
+            );
+        }
 
         Ok(())
     }
     .await;
 
     // Track finished (or failed) — drop the indicators so /health reports null.
-    *current_track.lock().await = None;
-    *current_source.lock().await = None;
+    // Only when they still describe this request: with prefetching, a newer
+    // track may already own them, and blanking would report a ghost null.
+    {
+        let mut track = current_track.lock().await;
+        if track.as_deref() == Some(tid.as_str()) {
+            *track = None;
+            *current_source.lock().await = None;
+        }
+    }
 
     if let Err(e) = &result {
         // JSON reason (bounded) + CORS: the extension diagnoses 502s via
@@ -509,9 +580,9 @@ async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
     };
     let body = stream_error_body(hint, reason);
     let resp = format!(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\n\r\n{}",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
         body.len(),
-        cors_allow_origin(origin),
+        cors_header_line(origin),
         body
     );
     writer.write_all(resp.as_bytes()).await?;
@@ -552,14 +623,14 @@ fn endpoint_for(method: &str, path: &str) -> Endpoint {
 async fn write_bad_request<W: tokio::io::AsyncWrite + Unpin>(
     write_half: &mut W,
     origin: Option<&str>,
+    hint: &str,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let body =
-        serde_json::json!({"status": "error", "hint": "missing or invalid track id"}).to_string();
+    let body = serde_json::json!({"status": "error", "hint": hint}).to_string();
     let resp = format!(
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\n\r\n{}",
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
         body.len(),
-        cors_allow_origin(origin),
+        cors_header_line(origin),
         body
     );
     write_half.write_all(resp.as_bytes()).await?;
@@ -567,10 +638,27 @@ async fn write_bad_request<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Value for `Access-Control-Allow-Origin`: echo the caller, or `*` for
-/// non-browser clients that send no Origin (curl, media elements).
-fn cors_allow_origin(origin: Option<&str>) -> &str {
-    origin.unwrap_or("*")
+/// Value for `Access-Control-Allow-Origin`, or `None` when the header must be
+/// omitted: an allowlisted Spotify caller is echoed back, a missing (or
+/// `null`) Origin gets `*` for curl/media elements, and anything else — e.g.
+/// a DNS-rebound `evil.com` — gets nothing, so a hostile page can neither
+/// read audio bytes nor error bodies fetched cross-origin.
+fn cors_allow_origin(origin: Option<&str>) -> Option<&str> {
+    match origin {
+        None => Some("*"),
+        Some("null") => Some("*"),
+        Some(o) if is_allowed_origin(o) => Some(o),
+        _ => None,
+    }
+}
+
+/// Renders the `Access-Control-Allow-Origin` header line, or nothing when
+/// [`cors_allow_origin`] denies the caller.
+fn cors_header_line(origin: Option<&str>) -> String {
+    match cors_allow_origin(origin) {
+        Some(v) => format!("\r\nAccess-Control-Allow-Origin: {}", v),
+        None => String::new(),
+    }
 }
 
 /// Answers a CORS preflight for any path: the Spotify client fetches audio
@@ -582,8 +670,8 @@ async fn write_preflight<W: tokio::io::AsyncWrite + Unpin>(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let resp = format!(
-        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Range, Origin, Content-Type\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        cors_allow_origin(origin)
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Range, Origin, Content-Type\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close{}\r\n\r\n",
+        cors_header_line(origin)
     );
     write_half.write_all(resp.as_bytes()).await?;
     write_half.flush().await?;
@@ -604,24 +692,37 @@ async fn write_forbidden<W: tokio::io::AsyncWrite + Unpin>(write_half: &mut W) -
     Ok(())
 }
 
+/// Returns the value of a request header, matched case-insensitively without
+/// allocating per line (the old `to_lowercase().starts_with(..)` built a
+/// `String` for every header line on every request).
+fn header_value(header_block: &str, name: &str) -> Option<String> {
+    header_block.lines().find_map(|l| {
+        let (key, value) = l.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+        None
+    })
+}
+
 /// Returns the value of the `Origin` header, if present.
 fn request_origin(header_block: &str) -> Option<String> {
-    header_block
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("origin:"))
-        .and_then(|l| l.split_once(':'))
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    header_value(header_block, "origin")
 }
 
 /// Returns the value of the `Range` header, if present.
 fn request_range(header_block: &str) -> Option<String> {
-    header_block
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("range:"))
-        .and_then(|l| l.split_once(':'))
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    header_value(header_block, "range")
+}
+
+/// Returns the value of the `If-Range` header, if present. Forwarded with
+/// `Range` so conditional seeks stay conditional instead of silently
+/// turning into unconditional ones.
+fn request_if_range(header_block: &str) -> Option<String> {
+    header_value(header_block, "if-range")
 }
 
 /// Origins allowed to use the admin endpoints. Spotify desktop serves the
@@ -633,7 +734,7 @@ fn is_allowed_origin(origin: &str) -> bool {
         || origin == "https://xpui.app.spotify.com"
         || origin == "app://spotify"
         || origin.starts_with("spotify://")
-        || origin == format!("http://{}:{}", PROXY_HOST, PROXY_PORT)
+        || origin == SHUTDOWN_ORIGIN
 }
 
 /// Only the loopback origin the binary itself uses may shut the proxy down.
@@ -641,7 +742,7 @@ fn is_allowed_origin(origin: &str) -> bool {
 /// cannot do is make Spotify send 127.0.0.1:18900 — that origin only comes
 /// from our own /shutdown caller (main.rs).
 fn is_shutdown_origin(origin: &str) -> bool {
-    origin == format!("http://{}:{}", PROXY_HOST, PROXY_PORT)
+    origin == SHUTDOWN_ORIGIN
 }
 
 /// Extracts a Spotify track ID from a URL.
@@ -789,9 +890,13 @@ mod tests {
     #[tokio::test]
     async fn bad_request_answers_400_with_cors() {
         let mut output = Vec::new();
-        write_bad_request(&mut output, Some("https://open.spotify.com"))
-            .await
-            .unwrap();
+        write_bad_request(
+            &mut output,
+            Some("https://open.spotify.com"),
+            "missing or invalid track id",
+        )
+        .await
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(text.contains("Access-Control-Allow-Origin: https://open.spotify.com\r\n"));
