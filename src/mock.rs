@@ -70,12 +70,21 @@ impl MockServer {
         }
     }
 
-    /// Start on a pre-reserved port (for fixtures that must embed the URL,
-    /// e.g. an encrypted CDN link pointing back at the mock).
-    pub async fn start_on(port: u16, routes: Vec<Route>) -> Self {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    /// Binds an ephemeral loopback port and returns the still-bound listener
+    /// with its port: serve it later via [`MockServer::serve`] with routes
+    /// that embed the port (no reserve-then-rebind race — the socket never
+    /// goes unbound between picking the port and serving it).
+    pub async fn bind_ephemeral() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("mock bind on reserved port");
+            .expect("mock bind");
+        let port = listener.local_addr().expect("mock port").port();
+        (listener, port)
+    }
+
+    /// Serves `routes` on an already-bound listener from [`MockServer::bind_ephemeral`].
+    pub fn serve(listener: tokio::net::TcpListener, routes: Vec<Route>) -> Self {
+        let port = listener.local_addr().expect("mock port").port();
         Self::serve_on(listener, routes);
         Self {
             base_url: format!("http://127.0.0.1:{}", port),
@@ -97,8 +106,8 @@ impl MockServer {
         });
     }
 
-    /// Reserves a loopback port without listening (caller passes it to
-    /// [`MockServer::start_on`]); tiny reuse race, localhost-only tests.
+    /// Reserves a loopback port without listening (caller uses it as a dead
+    /// address for failure-path tests; nothing ever binds it).
     pub async fn reserve_port() -> u16 {
         tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

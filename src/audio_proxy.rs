@@ -7,9 +7,9 @@
 //! 2. Requests the FLAC version from lucida.to via [`crate::lucida`]
 //! 3. Streams the FLAC data back to Spotify's player
 
-use anyhow::{anyhow, Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
@@ -110,6 +110,9 @@ impl AudioProxy {
         let listener = tokio::net::TcpListener::bind((PROXY_HOST, self.port))
             .await
             .context("Failed to bind audio proxy. Port may be in use.")?;
+        // Mint the per-boot shutdown token before serving: only readers of
+        // our own APPDATA dir can stop this instance from here on.
+        crate::shutdown_token::load_or_create().context("Failed to mint shutdown token")?;
 
         println!(
             "[kebabify] Audio proxy listening on {}:{}",
@@ -143,6 +146,9 @@ impl AudioProxy {
                     continue;
                 }
             };
+            // Loopback bulk audio: disable Nagle so headers + first chunk go
+            // out immediately instead of waiting for a delayed ACK.
+            let _ = socket.set_nodelay(true);
 
             let current_track = self.current_track.clone();
             let current_source = self.current_source.clone();
@@ -182,13 +188,19 @@ impl AudioProxy {
         Ok(())
     }
 
-    /// Sends a shutdown request to a running proxy instance.
+    /// Sends a shutdown request to a running proxy instance. Attaches the
+    /// per-boot token when this machine minted one (older proxies predate
+    /// the file and accept the Origin-only request).
     pub async fn request_shutdown() -> Result<()> {
         let url = format!("http://{}:{}/shutdown", PROXY_HOST, PROXY_PORT);
-        let resp = shared_client()
+        let mut req = shared_client()
             .get(&url)
             .timeout(Duration::from_secs(3))
-            .header("Origin", SHUTDOWN_ORIGIN)
+            .header("Origin", SHUTDOWN_ORIGIN);
+        if let Some(token) = crate::shutdown_token::load() {
+            req = req.header(crate::shutdown_token::TOKEN_HEADER, token);
+        }
+        let resp = req
             .send()
             .await
             .context("Failed to contact audio proxy for shutdown")?;
@@ -279,8 +291,8 @@ static UPDATE_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time::I
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 /// Cached `{"update_available", "current", "latest"}` body, refreshed past
-/// [`crate::updater::CHECK_TTL`]. Errors resolve to "no update" (and are
-/// cached too — an offline proxy must not hammer).
+/// [`crate::updater::CHECK_TTL`]. Errors resolve to "no update" and are NOT
+/// cached, so recovery after an outage is immediate.
 async fn cached_update_check(client: &reqwest::Client) -> String {
     if let Some((at, body)) = UPDATE_CACHE.lock().await.clone() {
         if at.elapsed() < crate::updater::CHECK_TTL {
@@ -378,6 +390,7 @@ async fn handle_client(
 
     // Origin is needed for CORS even on error responses below.
     let origin = request_origin(&header_block);
+    let shutdown_token = header_value(&header_block, crate::shutdown_token::TOKEN_HEADER);
 
     if has_conflicting_headers(&header_block) {
         let _ = write_bad_request(
@@ -457,17 +470,11 @@ async fn handle_client(
         })
         .to_string();
 
-        let mut resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
-            body.len()
-        );
-        if let Some(o) = origin {
-            resp.push_str(&format!("Access-Control-Allow-Origin: {}\r\n", o));
-        }
-        resp.push_str("\r\n");
-        resp.push_str(&body);
+        // Forbidden origins were rejected above, so the shared builder's
+        // CORS echo (`*` for curl, echo for Spotify) matches the siblings.
+        let resp = json_response("HTTP/1.1 200 OK", &body, origin.as_deref());
 
-        write_half.write_all(resp.as_bytes()).await?;
+        write_half.write_all(&resp).await?;
         write_half.flush().await?;
         return Ok(());
     }
@@ -481,13 +488,8 @@ async fn handle_client(
             }
         }
         let body = cached_update_check(&client).await;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
-            body.len(),
-            cors_header_line(origin.as_deref()),
-            body
-        );
-        write_half.write_all(resp.as_bytes()).await?;
+        let resp = json_response("HTTP/1.1 200 OK", &body, origin.as_deref());
+        write_half.write_all(&resp).await?;
         write_half.flush().await?;
         return Ok(());
     }
@@ -502,27 +504,33 @@ async fn handle_client(
                 return Err(anyhow!("Forbidden origin for /update/apply"));
             }
         }
-        let version = match crate::updater::check_update(&client).await? {
-            Some(info) => {
-                let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
-                let staged = crate::updater::staged_path(&exe);
-                crate::updater::download_release(&client, &info, &staged).await?;
-                info.version.clone()
-            }
-            None => String::new(),
-        };
+        let (version, error_hint): (String, Option<String>) =
+            match crate::updater::check_update(&client).await {
+                Ok(Some(info)) => {
+                    let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
+                    let staged = crate::updater::staged_path(&exe);
+                    match crate::updater::download_release(&client, &info, &staged).await {
+                        Ok(()) => (info.version.clone(), None),
+                        Err(e) => (String::new(), Some(format!("{:#}", e))),
+                    }
+                }
+                Ok(None) => (String::new(), None),
+                Err(e) => (String::new(), Some(format!("{:#}", e))),
+            };
+        // A failed update must not look like "up to date" (the old `?`
+        // propagation closed the connection with no response, and the badge
+        // just disappeared). Report it as a 502 JSON instead.
+        if let Some(hint) = error_hint {
+            write_update_error(&mut write_half, origin.as_deref(), &hint).await?;
+            return Err(anyhow!("Update failed: {}", hint));
+        }
         let body = if version.is_empty() {
             serde_json::json!({"status": "up-to-date"}).to_string()
         } else {
             serde_json::json!({"status": "updating", "version": version}).to_string()
         };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
-            body.len(),
-            cors_header_line(origin.as_deref()),
-            body
-        );
-        write_half.write_all(resp.as_bytes()).await?;
+        let resp = json_response("HTTP/1.1 200 OK", &body, origin.as_deref());
+        write_half.write_all(&resp).await?;
         write_half.flush().await?;
         if !version.is_empty() {
             // Answer went out: die so the swap helper can replace us, then
@@ -550,17 +558,24 @@ async fn handle_client(
                 return Err(anyhow!("Refusing shutdown without Origin header"));
             }
         }
+        // Plus the per-boot token (an Origin header is forgeable by any local
+        // process). Installs predating the token file fall back to Origin-only.
+        if let Some(expected) = crate::shutdown_token::load() {
+            let ok = shutdown_token
+                .as_deref()
+                .is_some_and(|t| crate::shutdown_token::verify(t, &expected));
+            if !ok {
+                write_forbidden(&mut write_half).await?;
+                return Err(anyhow!("Refusing shutdown without a valid token"));
+            }
+        }
 
         // Set the latched flag BEFORE waking the accept loop: even if the
         // notifier is missed, the loop-top check breaks on the next iteration.
         shutting_down.store(true, Ordering::Release);
         let body = serde_json::json!({"status": "stopping"}).to_string();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        write_half.write_all(resp.as_bytes()).await?;
+        let resp = json_response("HTTP/1.1 200 OK", &body, None);
+        write_half.write_all(&resp).await?;
         write_half.flush().await?;
         shutdown.notify_waiters();
         return Ok(());
@@ -638,12 +653,17 @@ async fn handle_client(
         // block: handshakes and polls are bounded, the body streams after.
         // The whole resolution is additionally capped: an unlucky track must
         // fail into native playback, not hang the player for minutes.
+        // `stage` names the in-flight step so the timeout error says WHERE
+        // the 60s went (lucida poll vs saavn fallback), not just THAT.
+        let stage = Arc::new(Mutex::new("starting"));
+        let stage_inner = stage.clone();
         let (mut audio_resp, is_flac, source): (reqwest::Response, bool, &'static str) =
             match tokio::time::timeout(RESOLVE_TIMEOUT, async {
                 let _resolve_permit = RESOLVE_PERMITS
                     .acquire()
                     .await
                     .context("resolve pool shut down")?;
+                *stage_inner.lock().await = "lucida";
                 match crate::lucida::open_stream(
                     &client,
                     &spotify_url,
@@ -652,12 +672,13 @@ async fn handle_client(
                 )
                 .await
                 {
-                    Ok(s) => Ok((s.response, true, "lucida")),
+                    Ok(s) => Ok((s.into_response(), true, "lucida")),
                     Err(lucida_err) => {
                         eprintln!(
                             "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
                             tid, lucida_err
                         );
+                        *stage_inner.lock().await = "saavn";
                         match crate::saavn::open_stream(
                             &client,
                             &tid,
@@ -666,7 +687,7 @@ async fn handle_client(
                         )
                         .await
                         {
-                            Ok(s) => Ok((s.response, false, "saavn")),
+                            Ok(s) => Ok((s.into_response(), false, "saavn")),
                             Err(saavn_err) => Err(anyhow!(
                                 "lucida: {:#}; saavn: {:#}",
                                 lucida_err,
@@ -682,8 +703,9 @@ async fn handle_client(
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     return Err(anyhow!(
-                        "upstream resolution timed out after {}s",
-                        RESOLVE_TIMEOUT.as_secs()
+                        "upstream resolution timed out after {}s (in stage: {})",
+                        RESOLVE_TIMEOUT.as_secs(),
+                        *stage.lock().await
                     ));
                 }
             };
@@ -744,35 +766,32 @@ async fn handle_client(
             .await
             .map_err(|e| anyhow!("Failed to flush headers: {}", e))?;
 
-        // HEAD asks for metadata only: headers go out, the body stays home.
-        // (Previously a HEAD streamed the whole track, violating HTTP.)
-        if method == "HEAD" {
-            eprintln!("[kebabify] HEAD for track {} (headers only)", tid);
-        } else {
-            // Stream the body. The idle timeout bounds a stalled upstream:
-            // healthy streams chunk continuously, so 60s without a byte
-            // means dead — cut it instead of holding the slot forever.
-            let mut total_bytes: u64 = 0;
-            while let Some(chunk) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, audio_resp.chunk())
-                .await
-                .context("Upstream stalled mid-stream")??
-            {
-                write_half.write_all(&chunk).await?;
-                total_bytes += chunk.len() as u64;
-            }
-
-            write_half.flush().await?;
-            eprintln!(
-                "[kebabify] Served {} for track {} ({} bytes)",
-                if is_flac {
-                    "FLAC"
-                } else {
-                    "AAC-320 (saavn fallback)"
-                },
-                tid,
-                total_bytes
-            );
+        // HEAD can never reach this point: the method gate above rejects
+        // everything but GET (and POST /update/apply), so there is no
+        // headers-only branch to maintain here.
+        // Stream the body. The idle timeout bounds a stalled upstream:
+        // healthy streams chunk continuously, so 60s without a byte
+        // means dead — cut it instead of holding the slot forever.
+        let mut total_bytes: u64 = 0;
+        while let Some(chunk) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, audio_resp.chunk())
+            .await
+            .context("Upstream stalled mid-stream")??
+        {
+            write_half.write_all(&chunk).await?;
+            total_bytes += chunk.len() as u64;
         }
+
+        write_half.flush().await?;
+        eprintln!(
+            "[kebabify] Served {} for track {} ({} bytes)",
+            if is_flac {
+                "FLAC"
+            } else {
+                "AAC-320 (saavn fallback)"
+            },
+            tid,
+            total_bytes
+        );
 
         Ok(())
     }
@@ -829,6 +848,36 @@ fn error_class(reason: &str) -> &'static str {
     }
 }
 
+/// One shared builder for the admin `200 JSON` responses (health,
+/// update/check, update/apply, shutdown): status line + fixed headers +
+/// CORS echo, so the seven hand-rolled responders can't drift apart.
+fn json_response(status_line: &str, body: &str, origin: Option<&str>) -> Vec<u8> {
+    format!(
+        "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
+        status_line,
+        body.len(),
+        cors_header_line(origin),
+        body
+    )
+    .into_bytes()
+}
+
+/// Writes a `502 Bad Gateway` JSON response when the self-update flow fails
+/// (check or download), so the badge can show the hint instead of vanishing.
+async fn write_update_error<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    origin: Option<&str>,
+    hint: &str,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let body = serde_json::json!({"status": "error", "hint": hint}).to_string();
+    writer
+        .write_all(&json_response("HTTP/1.1 502 Bad Gateway", &body, origin))
+        .await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     response_started: bool,
@@ -877,13 +926,14 @@ enum Endpoint {
 }
 
 /// Classifies a request by method + path. Preflight wins over everything so
-/// a CORS probe never reaches an admin handler. Update-apply is POST-only.
+/// a CORS probe never reaches an admin handler. Update-apply is POST-only,
+/// shutdown is GET-only (a POST /shutdown is a client bug, not a command).
 fn endpoint_for(method: &str, path: &str) -> Endpoint {
     if method == "OPTIONS" {
         Endpoint::Preflight
     } else if path == "/health" {
         Endpoint::Health
-    } else if path == "/shutdown" {
+    } else if path == "/shutdown" && method == "GET" {
         Endpoint::Shutdown
     } else if path == "/update/check" {
         Endpoint::UpdateCheck
@@ -1009,11 +1059,7 @@ fn header_values<'a>(header_block: &'a str, name: &str) -> Vec<&'a str> {
                 return None;
             }
             let v = value.trim();
-            if v.is_empty() {
-                None
-            } else {
-                Some(v)
-            }
+            if v.is_empty() { None } else { Some(v) }
         })
         .collect()
 }
@@ -1214,17 +1260,21 @@ mod tests {
         write_stream_error(&mut output, false, Some("https://evil.com"), "boom")
             .await
             .unwrap();
-        assert!(!String::from_utf8(output)
-            .unwrap()
-            .contains("Access-Control-Allow-Origin"));
+        assert!(
+            !String::from_utf8(output)
+                .unwrap()
+                .contains("Access-Control-Allow-Origin")
+        );
 
         let mut output = Vec::new();
         write_preflight(&mut output, Some("https://evil.com"))
             .await
             .unwrap();
-        assert!(!String::from_utf8(output)
-            .unwrap()
-            .contains("Access-Control-Allow-Origin"));
+        assert!(
+            !String::from_utf8(output)
+                .unwrap()
+                .contains("Access-Control-Allow-Origin")
+        );
     }
 
     #[tokio::test]
@@ -1274,7 +1324,7 @@ mod tests {
         assert_eq!(endpoint_for("GET", "/update/check"), Endpoint::UpdateCheck);
         assert_eq!(endpoint_for("POST", "/update/apply"), Endpoint::UpdateApply);
         // POST anywhere else is not special (→ 400 downstream).
-        assert_eq!(endpoint_for("POST", "/shutdown"), Endpoint::Shutdown);
+        assert_eq!(endpoint_for("POST", "/shutdown"), Endpoint::Audio);
         assert_eq!(
             endpoint_for("GET", "/?track=4uLU6hMCjMI75M1A2tKUQC"),
             Endpoint::Audio
@@ -1285,7 +1335,7 @@ mod tests {
         assert_eq!(endpoint_for("OPTIONS", "/?track=x"), Endpoint::Preflight);
         // Near-misses are audio (→ 400 downstream), not admin endpoints.
         assert_eq!(endpoint_for("GET", "/health?x=1"), Endpoint::Audio);
-        assert_eq!(endpoint_for("POST", "/shutdown"), Endpoint::Shutdown);
+        assert_eq!(endpoint_for("DELETE", "/shutdown"), Endpoint::Audio);
     }
 
     #[test]

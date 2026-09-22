@@ -4,7 +4,7 @@
 //! audio proxy. Keeping the token extraction here (instead of duplicating it)
 //! avoids the drift that previously broke CSRF/expiry parsing in the proxy.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 
 /// The lucida.to API base URL.
@@ -27,9 +27,21 @@ pub fn cookies_file_path() -> PathBuf {
 
 fn cookies_path() -> PathBuf {
     if let Some(p) = cookies_override() {
+        log_source_once(&format!("cookies file {} (from env override)", p.display()));
         return p;
     }
-    default_cookies_path()
+    let p = default_cookies_path();
+    log_source_once(&format!("cookies file {} (default location)", p.display()));
+    p
+}
+
+/// One-shot stderr note naming which env/dir source won (observability for
+/// hijacked-`APPDATA`/`PATH` debugging). Silent in tests after first call.
+fn log_source_once(msg: &str) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[kebabify] {}", msg);
+    }
 }
 
 /// Explicit file override, when set. Accepts the current name plus the
@@ -250,8 +262,14 @@ const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// A resolved, ready-to-download FLAC stream from lucida.to.
 #[derive(Debug)]
 pub struct LucidaStream {
-    /// The HTTP response for the audio download, ready to be streamed.
-    pub response: reqwest::Response,
+    response: reqwest::Response,
+}
+
+impl LucidaStream {
+    /// Consumes the stream into the underlying HTTP response for piping.
+    pub fn into_response(self) -> reqwest::Response {
+        self.response
+    }
 }
 
 /// Endpoint set for the lucida flow. `Default` is production; tests inject a
@@ -477,8 +495,7 @@ async fn open_stream_with(
 
 /// Stock User-Agent for requests that carry no captured browser session.
 /// Shared with the Saavn fallback, which is sessionless by design.
-pub const STOCK_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+pub const STOCK_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 /// Extracts the CSRF token from the lucida HTML page.
 ///
@@ -673,12 +690,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Serializes tests that touch the process-global env block (parallel
+    /// test threads share one env; without this a concurrent
+    /// `load_session` reader flakes).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn cookies_roundtrip_and_missing() {
+        let _env = ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("kebabify_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cookies.txt");
-        std::env::set_var("KEBABIFY_COOKIES_PATH", &path);
+        // Edition 2024: set_var is unsafe (process-global mutation).
+        unsafe { std::env::set_var("KEBABIFY_COOKIES_PATH", &path) };
 
         assert!(load_session().is_none());
 
@@ -692,7 +716,7 @@ mod tests {
         assert_eq!(s.cookie, "cf_clearance=abc; __cf_bm=def");
 
         std::fs::remove_file(&path).unwrap();
-        std::env::remove_var("KEBABIFY_COOKIES_PATH");
+        unsafe { std::env::remove_var("KEBABIFY_COOKIES_PATH") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -747,8 +771,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.response.status(), 200);
-        assert_eq!(s.response.bytes().await.unwrap().as_ref(), MOCK_AUDIO);
+        let r = s.into_response();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), MOCK_AUDIO);
 
         let s = open_stream_with(
             &client,
@@ -759,8 +784,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.response.status(), 206);
-        assert_eq!(s.response.bytes().await.unwrap().as_ref(), &MOCK_AUDIO[..4]);
+        let r = s.into_response();
+        assert_eq!(r.status(), 206);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), &MOCK_AUDIO[..4]);
     }
 
     /// Status endpoint dead (connection refused): fail fast on transport
@@ -775,26 +801,31 @@ mod tests {
             Route::catch_all(200, resolve_html()),
         ])
         .await;
-        let dead = MockServer::reserve_port().await;
-        let ep = LucidaEndpoints {
-            base: mock.base_url.clone(),
-            api_load: format!("{}/api/load", mock.base_url),
-            status_tpl: format!("http://127.0.0.1:{}/status/{{handoff}}", dead),
-        };
+        // Reserve-then-drop races a port thief (localhost-only, microseconds):
+        // retry with a fresh port instead of flaking.
         let client = reqwest::Client::new();
-        let err = open_stream_with(
-            &client,
-            "https://open.spotify.com/track/abc",
-            None,
-            None,
-            &ep,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{:#}", err).contains("unreachable"),
-            "unexpected error: {:#}",
-            err
-        );
+        let mut last = String::new();
+        for _ in 0..3 {
+            let dead = MockServer::reserve_port().await;
+            let ep = LucidaEndpoints {
+                base: mock.base_url.clone(),
+                api_load: format!("{}/api/load", mock.base_url),
+                status_tpl: format!("http://127.0.0.1:{}/status/{{handoff}}", dead),
+            };
+            let err = open_stream_with(
+                &client,
+                "https://open.spotify.com/track/abc",
+                None,
+                None,
+                &ep,
+            )
+            .await
+            .unwrap_err();
+            last = format!("{:#}", err);
+            if last.contains("unreachable") {
+                return;
+            }
+        }
+        panic!("unexpected error after retries: {}", last);
     }
 }

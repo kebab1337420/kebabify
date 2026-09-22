@@ -1,7 +1,8 @@
 [package]
 name = "kebabify"
 version = "0.5.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 authors = ["kebab1337420"]
 description = "Spicetify-like extension for Spotify: ad-free, lossless audio via lucida.to API with JioSaavn fallback"
 license = "MIT"
@@ -34,8 +35,14 @@ percent-encoding = "2"
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 
-# Firefox-family cookie store (cookies.sqlite) for the cookie import
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Firefox-family cookie store (cookies.sqlite) for the cookie import.
+# Optional: `--no-default-features` drops bundled SQLite (Chromium CDP
+# import keeps working; Firefox import errors politely).
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+default = ["firefox-import"]
+firefox-import = ["dep:rusqlite"]
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
@@ -46,6 +53,9 @@ clap = { version = "4", features = ["derive"] }
 open = "5"
 url = "2"
 which = "8"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = "z"
