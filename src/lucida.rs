@@ -135,28 +135,40 @@ fn strip_bom(s: &str) -> &str {
 
 /// Persists a browser session for the lucida Cloudflare challenge.
 /// `cookie_header` is the raw `Cookie` value, e.g. "cf_clearance=…; __cf_bm=…".
+/// Written atomically (tmp + rename): proxy tasks re-read the file on every
+/// track, and a torn write would silently downgrade one track to no cookies.
 pub fn save_cookies(user_agent: &str, cookie_header: &str) -> Result<()> {
     let path = cookies_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+    let tmp = path.with_extension("txt.tmp");
     std::fs::write(
-        &path,
+        &tmp,
         format!(
             "{}\n{}\n",
             strip_bom(user_agent.trim()),
             strip_bom(cookie_header.trim())
         ),
     )
-    .context("Failed to write cookies file")?;
+    .with_context(|| format!("Failed to write {}", tmp.display()))?;
     // Live Cloudflare session: owner-only on Unix (Windows inherits the
     // per-user %APPDATA% ACL, so nothing to do there).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
             .context("Failed to restrict cookies file permissions")?;
+    }
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("Failed to move {} into place", path.display()))?;
+    // A legacy Kebaccify file would otherwise rot forever, never read again
+    // now that the new path exists.
+    if let Some(legacy) = legacy_cookies_path() {
+        if legacy != path {
+            let _ = std::fs::remove_file(&legacy);
+        }
     }
     Ok(())
 }

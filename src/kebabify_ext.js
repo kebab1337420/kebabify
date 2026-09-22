@@ -27,6 +27,12 @@
     var playbarInterval = null;
     var flacVerified = false;
     var proxyAlive = false;
+    // Per-track chatter, off unless explicitly enabled in devtools:
+    // window.__kebabifyDebug = true
+    function debugLog() {
+        if (window.__kebabifyDebug) console.log.apply(console, arguments);
+    }
+
     // Module-level guards so observers/wrappers are installed only once.
     var fetchPatched = false;
     var xhrPatched = false;
@@ -116,7 +122,7 @@
             };
             (document.body || document.documentElement).appendChild(badge);
         }
-        badge.textContent = '\u2193 ' + latest + ' — mettre à jour';
+        badge.textContent = '\u2193 v' + latest.replace(/^v/, '') + ' — mettre à jour';
         badge.setAttribute('data-kebabify-update', 'available');
     }
 
@@ -269,7 +275,7 @@
         if (!isValidSpotifyTrackId(trackId)) trackId = currentSpotifyTrackId;
         if (!isValidSpotifyTrackId(trackId)) return null;
 
-        console.log('[kebabify] FLAC: proxying to local for track', trackId);
+        debugLog('[kebabify] FLAC: proxying to local for track', trackId);
         return PROXY_BASE + '?track=' + trackId;
     }
 
@@ -517,7 +523,7 @@
         badge.id = 'kebabify-badge';
         badge.type = 'button';
         badge.setAttribute('data-kebabify', 'true');
-        badge.setAttribute('aria-label', 'kebabify FLAC mode');
+        badge.setAttribute('aria-label', 'kebabify mode FLAC');
         badge.setAttribute('data-kebabify-flac', flacPriority ? 'on' : 'off');
         badge.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
         badge.setAttribute('data-kebabify-proxy', proxyAlive ? 'true' : 'false');
@@ -548,7 +554,7 @@
         } else if (flacPriority && proxyAlive) {
             icon = svgSpeaker;
             label = 'KB';
-            title = '\u2026 FLAC mode actif';
+            title = 'FLAC en attente de vérification';
             el.className = 'flac-on';
         } else if (flacPriority) {
             icon = svgOff;
@@ -641,7 +647,7 @@
                         flacVerified = false;
                         updateVerifiedIndicator();
                     }
-                    console.log('[kebabify] Now playing track:', nowId);
+                    debugLog('[kebabify] Now playing track:', nowId);
                 }
                 var anyPlaying = false;
                 var proxifiedPlaying = false;

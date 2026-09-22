@@ -211,17 +211,26 @@ impl AudioProxy {
     /// Waits up to `timeout` for the proxy to answer `/health` at all
     /// (readiness after spawn — any status counts, the port is bound).
     pub async fn wait_until_ready(timeout: Duration) -> bool {
-        let url = format!("http://{}:{}/health", PROXY_HOST, PROXY_PORT);
-        let client = shared_client();
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            if client
-                .get(&url)
-                .timeout(Duration::from_secs(1))
-                .send()
-                .await
-                .is_ok()
-            {
+            // Our own health shape, not just any 200: a foreign port
+            // squatter must not count as "ready".
+            if proxy_health().await.is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        false
+    }
+
+    /// Waits up to `timeout` for the proxy to stop answering (inverse of
+    /// readiness — used after requesting a shutdown before respawning, so a
+    /// draining old instance still holding the port doesn't make the new
+    /// spawn fail its bind).
+    pub async fn wait_until_stopped(timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if !Self::is_running().await {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -287,21 +296,31 @@ async fn cached_update_check(client: &reqwest::Client) -> String {
             return body;
         }
     }
-    let body = match crate::updater::check_update(client).await {
-        Ok(Some(info)) => serde_json::json!({
-            "update_available": true,
-            "current": crate::updater::current_version(),
-            "latest": info.version,
-        })
-        .to_string(),
-        _ => serde_json::json!({
-            "update_available": false,
-            "current": crate::updater::current_version(),
-            "latest": serde_json::Value::Null,
-        })
-        .to_string(),
+    // Errors are deliberately NOT cached: an offline proxy would otherwise
+    // report "no update" for a full hour.
+    let (available, body) = match crate::updater::check_update(client).await {
+        Ok(Some(info)) => (
+            true,
+            serde_json::json!({
+                "update_available": true,
+                "current": crate::updater::current_version(),
+                "latest": info.version,
+            })
+            .to_string(),
+        ),
+        _ => (
+            false,
+            serde_json::json!({
+                "update_available": false,
+                "current": crate::updater::current_version(),
+                "latest": serde_json::Value::Null,
+            })
+            .to_string(),
+        ),
     };
-    *UPDATE_CACHE.lock().await = Some((std::time::Instant::now(), body.clone()));
+    if available {
+        *UPDATE_CACHE.lock().await = Some((std::time::Instant::now(), body.clone()));
+    }
     body
 }
 

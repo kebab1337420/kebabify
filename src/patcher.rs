@@ -103,7 +103,7 @@ impl SpotifyPatcher {
 
         eprintln!("  Restored: user.css");
         eprintln!("  Restored: index.html");
-        eprintln!("  Removed: kebabify_ext.js");
+        eprintln!("  Removed: kebabify_ext.js (+ legacy kebaccify_ext.js)");
 
         self.unsync_spicetify_extension()?;
 
@@ -222,6 +222,18 @@ impl SpotifyPatcher {
         std::fs::create_dir_all(&backup_dir)
             .with_context(|| format!("Failed to create backup dir {}", backup_dir.display()))?;
 
+        // Spotify self-updates replace xpui files behind our back: backups
+        // taken for the old version would restore a DOWNGRADE on uninstall.
+        // A fingerprint of index.html detects the rotation and re-snapshots.
+        if Self::backups_stale(&backup_dir, &self.xpui_dir.join("index.html")) {
+            eprintln!("  Spotify updated since last backup — refreshing backups");
+            std::fs::remove_dir_all(&backup_dir)
+                .with_context(|| format!("Failed to clear stale {}", backup_dir.display()))?;
+            std::fs::create_dir_all(&backup_dir).with_context(|| {
+                format!("Failed to recreate backup dir {}", backup_dir.display())
+            })?;
+        }
+
         // Only files that `apply_patches` actually modifies. Because backup
         // files are never overwritten once created, the first run always
         // captures the true originals — re-applying keeps the pristine copy.
@@ -238,8 +250,42 @@ impl SpotifyPatcher {
             }
         }
 
+        Self::write_fingerprint(&backup_dir, &self.xpui_dir.join("index.html"));
         eprintln!("  Backed up original files ({})", backed_up);
         Ok(())
+    }
+
+    /// `len:mtime` fingerprint of a file, or `None` when unreadable.
+    fn fingerprint(path: &std::path::Path) -> Option<String> {
+        let m = std::fs::metadata(path).ok()?;
+        let modified = m
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(format!("{}:{}", m.len(), modified))
+    }
+
+    /// Whether existing backups predate the current install files.
+    fn backups_stale(backup_dir: &std::path::Path, index: &std::path::Path) -> bool {
+        let recorded = std::fs::read_to_string(backup_dir.join("fingerprint"))
+            .ok()
+            .map(|s| s.trim().to_string());
+        let current = Self::fingerprint(index);
+        match (recorded, current) {
+            (Some(r), Some(c)) => r != c,
+            // No fingerprint yet (pre-feature backups): refresh once to
+            // adopt one, rather than trusting unknown-vintage files.
+            (None, Some(_)) => backup_dir.join("index.html").exists(),
+            _ => false,
+        }
+    }
+
+    fn write_fingerprint(backup_dir: &std::path::Path, index: &std::path::Path) {
+        if let Some(fp) = Self::fingerprint(index) {
+            let _ = std::fs::write(backup_dir.join("fingerprint"), fp);
+        }
     }
 
     /// Inject kebabify CSS theme into the Spotify user.css file.
@@ -781,6 +827,41 @@ mod tests {
         }
         // Idempotent: a second run is a no-op.
         patcher.remove_backup_dirs().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_backups_refresh_on_install_change() {
+        let root =
+            std::env::temp_dir().join(format!("kebabify_fingerprint_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let xpui = root.join("Apps").join("xpui");
+        std::fs::create_dir_all(&xpui).unwrap();
+        let patcher = SpotifyPatcher {
+            spotify_dir: root.clone(),
+            xpui_dir: xpui.clone(),
+        };
+        // v1 snapshot.
+        std::fs::write(xpui.join("index.html"), "<html>v1</html>").unwrap();
+        patcher.backup_files().unwrap();
+        let backup = patcher.get_backup_dir();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("index.html")).unwrap(),
+            "<html>v1</html>"
+        );
+        // Spotify "updates": different bytes force a new fingerprint.
+        std::fs::write(xpui.join("index.html"), "<html>v2 much longer</html>").unwrap();
+        patcher.backup_files().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("index.html")).unwrap(),
+            "<html>v2 much longer</html>"
+        );
+        // Same content again: backups kept, not rewritten.
+        patcher.backup_files().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("index.html")).unwrap(),
+            "<html>v2 much longer</html>"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
