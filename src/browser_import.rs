@@ -116,9 +116,10 @@ enum BrowserKind {
 async fn import_chromium(browser: &Path) -> Result<()> {
     let port = free_port().context("Could not reserve a debug port")?;
     let profile = temp_profile_dir()?;
+    let label = browser_label(browser);
     println!(
-        "Opening a fresh Chrome window on lucida.to (port {} for cookies)...",
-        port
+        "Opening a fresh {} window on lucida.to (port {} for cookies)...",
+        label, port
     );
     println!("Solve the Cloudflare challenge in that window.");
 
@@ -171,6 +172,7 @@ async fn import_firefox(exe: &Path, label: &str) -> Result<()> {
         .arg("-profile")
         .arg(&profile)
         .arg("--no-remote")
+        .arg("--new-instance")
         .arg("https://lucida.to")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -187,6 +189,10 @@ async fn import_firefox(exe: &Path, label: &str) -> Result<()> {
     })?;
 
     let result = async {
+        // Fail fast when the browser ignored the throwaway profile (e.g. it
+        // opened the URL in the already-running instance instead): without
+        // its lockfile, polling cookies.sqlite would burn the full 10 min.
+        wait_for_profile_lock(&profile).await?;
         let header = poll_firefox_cookies(&profile).await?;
         lucida::save_cookies(&ua, &header)?;
         println!(
@@ -204,6 +210,23 @@ async fn import_firefox(exe: &Path, label: &str) -> Result<()> {
     let _ = std::fs::remove_dir_all(&profile);
 
     result
+}
+
+/// Waits (up to 30 s) for the browser to lock the throwaway profile
+/// (`parent.lock` on Windows, `lock` symlink elsewhere). Absence means our
+/// flags were ignored and the URL opened in the existing instance — fail
+/// fast with guidance instead of polling an empty profile for 10 minutes.
+async fn wait_for_profile_lock(profile: &Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if profile.join("parent.lock").exists() || profile.join("lock").exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(anyhow!(
+        "The browser did not pick up the throwaway profile — close all its windows and retry"
+    ))
 }
 
 /// Polls the throwaway profile's cookie store until `cf_clearance` appears.
@@ -277,15 +300,50 @@ fn query_cookie_header(db: &Path) -> Result<Option<String>> {
     ))
 }
 
-/// Rebuilds this Firefox-family binary's User-Agent from its
-/// `application.ini` (`Version=` under `[App]`), e.g.
-/// `Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0`.
-/// Pure parser tested below; file IO stays in the caller.
+/// Rebuilds this Firefox-family binary's User-Agent. Prefers the Gecko
+/// milestone from `platform.ini` (accurate for Firefox *and* forks like Zen,
+/// whose `application.ini` carries the product version instead), falling back
+/// to `application.ini`'s `Version` (== Gecko for stock Firefox).
+/// Pure parsers tested below; file IO stays in the caller.
 fn firefox_user_agent(exe: &Path) -> Result<String> {
     let dir = exe.parent().context("Browser path has no parent dir")?;
+    if let Ok(platform) = std::fs::read_to_string(dir.join("platform.ini")) {
+        if let Some(ua) = gecko_ua_from_platform_ini(&platform) {
+            return Ok(ua);
+        }
+    }
     let ini = std::fs::read_to_string(dir.join("application.ini"))
         .context("Failed to read application.ini next to the browser")?;
     firefox_ua_from_ini(&ini).ok_or_else(|| anyhow!("No Version= found in application.ini"))
+}
+
+/// `Milestone=` under `[Build]` in `platform.ini` (e.g. `140.0`, `128.0a1`
+/// → suffix stripped). Pure for tests.
+fn gecko_ua_from_platform_ini(ini: &str) -> Option<String> {
+    let mut in_build = false;
+    for line in ini.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_build = t.eq_ignore_ascii_case("[Build]");
+            continue;
+        }
+        if in_build {
+            if let Some(v) = t.strip_prefix("Milestone=").map(str::trim) {
+                let digits: String = v
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                let v = digits.trim_matches('.');
+                if !v.is_empty() {
+                    return Some(format!(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{}) Gecko/20100101 Firefox/{}",
+                        v, v
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn firefox_ua_from_ini(ini: &str) -> Option<String> {
@@ -471,6 +529,12 @@ fn known_browser_layouts() -> Vec<(Vec<&'static str>, &'static str, BrowserKind)
 }
 
 fn find_browser() -> Option<FoundBrowser> {
+    // The user's default browser first — not whatever happens to be
+    // installed first in our scan order.
+    #[cfg(target_os = "windows")]
+    if let Some(found) = default_browser() {
+        return Some(found);
+    }
     for var in [
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
@@ -539,6 +603,94 @@ fn classify_exe(path: &Path) -> BrowserKind {
     }
 }
 
+/// Default browser from the Windows `https` URL association: UserChoice ProgId
+/// → its `shell\open\command` exe. Classified like any other hit, so the
+/// right import flow (CDP vs sqlite) is picked automatically.
+#[cfg(target_os = "windows")]
+fn default_browser() -> Option<FoundBrowser> {
+    use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, KEY_READ};
+
+    let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
+    let choice = hkcu
+        .open_subkey_with_flags(
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+            KEY_READ,
+        )
+        .ok()?;
+    let prog_id: String = choice.get_value("ProgId").ok()?;
+    let classes = winreg::RegKey::predef(HKEY_CLASSES_ROOT);
+    // UserChoice ProgIds often carry an integrity hash suffix
+    // (`HeliumHTM.NCEH…`) with no matching Classes key: strip trailing
+    // dot-segments until an `open\command` resolves.
+    let mut candidate = prog_id.as_str();
+    loop {
+        let key = format!(r"{}\shell\open\command", candidate);
+        if let Ok(cmd_key) = classes.open_subkey_with_flags(&key, KEY_READ) {
+            if let Ok(cmd) = cmd_key.get_value::<String, _>("") {
+                if let Some(exe) = parse_exe_from_command(&cmd) {
+                    if exe.exists() {
+                        return Some(FoundBrowser {
+                            kind: classify_exe(&exe),
+                            exe,
+                        });
+                    }
+                }
+            }
+        }
+        let i = candidate.rfind('.')?;
+        candidate = &candidate[..i];
+    }
+}
+
+/// Extracts the exe path from an open-command string:
+/// `"C:\a\b.exe" --args %1` or `C:\a\b.exe -url %1`. Pure for tests.
+fn parse_exe_from_command(cmd: &str) -> Option<PathBuf> {
+    let cmd = cmd.trim();
+    if let Some(rest) = cmd.strip_prefix('"') {
+        let end = rest.find('"')?;
+        if rest[..end].trim().is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(rest[..end].trim()));
+    }
+    let end = cmd.find(char::is_whitespace)?;
+    if cmd[..end].trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(cmd[..end].trim()))
+}
+
+/// Display name for launch messages, from the exe file name.
+fn browser_label(exe: &Path) -> &'static str {
+    let name = exe
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if name.contains("chrome") {
+        "Chrome"
+    } else if name.contains("edge") || name.contains("msedge") {
+        "Edge"
+    } else if name.contains("brave") {
+        "Brave"
+    } else if name.contains("vivaldi") {
+        "Vivaldi"
+    } else if name.contains("opera") {
+        "Opera"
+    } else if name.contains("arc") {
+        "Arc"
+    } else if name.contains("firefox") {
+        "Firefox"
+    } else if name.contains("zen") {
+        "Zen"
+    } else if name.contains("librewolf") {
+        "LibreWolf"
+    } else if name.contains("waterfox") {
+        "Waterfox"
+    } else {
+        "browser"
+    }
+}
 /// Windows: read the canonical path from the `App Paths` registry keys, which
 /// browsers register when installed. Classified by exe name so Chromium forks
 /// (Helium…) and Firefox-family browsers resolve to the right import flow.
@@ -699,6 +851,35 @@ mod tests {
     }
 
     #[test]
+    fn open_commands_parsed() {
+        assert_eq!(
+            parse_exe_from_command(
+                r#""C:\Program Files\Mozilla Firefox\firefox.exe" -osint -url "%1""#
+            ),
+            Some(PathBuf::from(
+                r"C:\Program Files\Mozilla Firefox\firefox.exe"
+            ))
+        );
+        assert_eq!(
+            parse_exe_from_command("C:\\Firefox\\firefox.exe -osint -url %1"),
+            Some(PathBuf::from("C:\\Firefox\\firefox.exe"))
+        );
+        assert_eq!(parse_exe_from_command(""), None);
+        assert_eq!(parse_exe_from_command("\"\""), None);
+        assert_eq!(parse_exe_from_command("   "), None);
+    }
+
+    #[test]
+    fn browser_labels() {
+        assert_eq!(browser_label(&PathBuf::from("C:\\x\\brave.exe")), "Brave");
+        assert_eq!(
+            browser_label(&PathBuf::from("C:\\x\\firefox.exe")),
+            "Firefox"
+        );
+        assert_eq!(browser_label(&PathBuf::from("C:\\x\\weird.exe")), "browser");
+    }
+
+    #[test]
     fn firefox_ua_built_from_ini() {
         let ini = "[App]\nVendor=Mozilla\nVersion=140.0\nBuildID=20260601\n";
         assert_eq!(
@@ -709,6 +890,26 @@ mod tests {
         );
         assert_eq!(firefox_ua_from_ini("[App]\nVendor=x\n"), None);
         assert_eq!(firefox_ua_from_ini(""), None);
+    }
+
+    #[test]
+    fn gecko_milestone_preferred_over_product_version() {
+        // Zen-style: product 1.x on Gecko 128 — the UA must carry Gecko.
+        let platform = "[Build]\nBuildID=20240901\nMilestone=128.0a1\nSourceRepository=x\n";
+        assert_eq!(
+            gecko_ua_from_platform_ini(platform).as_deref(),
+            Some(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+            )
+        );
+        assert_eq!(
+            gecko_ua_from_platform_ini("[Build]\nMilestone=140.0\n").as_deref(),
+            Some(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
+            )
+        );
+        assert_eq!(gecko_ua_from_platform_ini("[Build]\nBuildID=x\n"), None);
+        assert_eq!(gecko_ua_from_platform_ini(""), None);
     }
 
     #[test]

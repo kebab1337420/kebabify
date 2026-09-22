@@ -177,6 +177,14 @@ async fn ensure_proxy() -> Result<()> {
                     other
                 );
                 stop_proxy().await;
+                // The old instance drains (up to 5s) while still holding the
+                // port: wait for it to actually die before respawning, or the
+                // new child fails its bind and we "reuse" a corpse.
+                if !audio_proxy::AudioProxy::wait_until_stopped(std::time::Duration::from_secs(8))
+                    .await
+                {
+                    println!("Old proxy still alive — spawning anyway (bind may fail).");
+                }
             }
         }
     }
