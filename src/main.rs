@@ -302,10 +302,17 @@ fn was_handoff(elapsed: std::time::Duration) -> bool {
     elapsed < std::time::Duration::from_secs(3)
 }
 
+/// Resolves the patcher, pointing at the Spotify download when the install
+/// is missing. Single place so every command guides the same way.
+fn require_patcher() -> Result<patcher::SpotifyPatcher> {
+    patcher::SpotifyPatcher::new()
+        .context("kebabify requires Spotify to be installed (https://www.spotify.com/download)")
+}
+
 async fn cmd_uninstall() -> Result<()> {
     println!("kebabify — removing patches...");
     stop_proxy().await;
-    match patcher::SpotifyPatcher::new() {
+    match require_patcher() {
         Ok(p) => {
             p.uninstall_patches()?;
             println!("Patches removed. Spotify restored to original.");
@@ -321,12 +328,20 @@ async fn cmd_uninstall() -> Result<()> {
             eprintln!("  Removed: proxy log");
         }
     }
+    // A failed update may leave a staged kebabify.exe.new behind.
+    if let Ok(exe) = std::env::current_exe() {
+        let staged = updater::staged_path(&exe);
+        if staged.exists() {
+            let _ = std::fs::remove_file(&staged);
+            eprintln!("  Removed: staged update");
+        }
+    }
     Ok(())
 }
 
 async fn cmd_update_ext() -> Result<()> {
     println!("kebabify — updating extensions...");
-    match patcher::SpotifyPatcher::new() {
+    match require_patcher() {
         Ok(p) => {
             p.update_extensions()?;
             println!("Extensions updated.");
@@ -337,7 +352,7 @@ async fn cmd_update_ext() -> Result<()> {
 }
 
 async fn cmd_status() -> Result<()> {
-    match patcher::SpotifyPatcher::new() {
+    match require_patcher() {
         Ok(p) => {
             p.print_status()?;
             print_runtime_state().await;
@@ -418,6 +433,7 @@ async fn cmd_update() -> Result<()> {
 }
 
 /// Manual cookie entry for the interactive menu: prompts for both lines.
+/// Offers to force through a clearance-less paste (the CLI `--force`).
 async fn cmd_cookie_prompt() -> Result<()> {
     use std::io::{BufRead, Write};
     print!("User-Agent du navigateur : ");
@@ -432,16 +448,27 @@ async fn cmd_cookie_prompt() -> Result<()> {
     if std::io::stdin().lock().read_line(&mut cookie).unwrap_or(0) == 0 {
         return Ok(());
     }
-    cmd_cookie(ua.trim().to_string(), cookie.trim().to_string(), false).await
+    let ua = ua.trim().to_string();
+    let cookie = cookie.trim().to_string();
+    if !lucida::cookie_has_clearance(&cookie) {
+        print!("Pas de cf_clearance — écraser quand même ? [o/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer).ok();
+        if !matches!(
+            answer.trim().to_lowercase().as_str(),
+            "o" | "oui" | "y" | "yes"
+        ) {
+            println!("Abandonné — session existante conservée.");
+            return Ok(());
+        }
+        return cmd_cookie(ua, cookie, true).await;
+    }
+    cmd_cookie(ua, cookie, false).await
 }
 
 async fn cmd_apply() -> Result<()> {
-    let p = match patcher::SpotifyPatcher::new() {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(e.context("kebabify requires Spotify to be installed"));
-        }
-    };
+    let p = require_patcher()?;
     println!("kebabify — applying patches to Spotify client...");
     p.apply_patches()?;
     println!("Patches applied successfully!");
@@ -455,12 +482,7 @@ async fn cmd_apply() -> Result<()> {
 }
 
 async fn cmd_run() -> Result<()> {
-    let p = match patcher::SpotifyPatcher::new() {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(e.context("kebabify requires Spotify to be installed"));
-        }
-    };
+    let p = require_patcher()?;
     println!("kebabify — applying patches to Spotify client...");
     p.apply_patches()?;
     println!("Patches applied successfully!");
@@ -509,7 +531,13 @@ async fn cmd_run() -> Result<()> {
         println!("Spotify was already running — proxy left running (as with apply).");
         return Ok(());
     }
-    println!("Spotify exited ({}), stopping the audio proxy...", status);
+    // A crash (non-zero) must be visible to scripts: surface the code
+    // instead of exiting 0 like a clean quit.
+    if !status.success() {
+        stop_proxy().await;
+        return Err(anyhow::anyhow!("Spotify exited with {}", status));
+    }
+    println!("Spotify exited, stopping the audio proxy (re-run `run` next launch)...");
     stop_proxy().await;
     Ok(())
 }

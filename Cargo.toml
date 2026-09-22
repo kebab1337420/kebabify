@@ -19,6 +19,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # Serialization
 serde_json = "1"
 
+# SHA-256 verification of release assets (self-update channel)
+sha2 = "0.10"
+
 # JioSaavn media URL decryption (DES-ECB, see saavn.rs)
 des = "0.8"
 cipher = "0.4"
