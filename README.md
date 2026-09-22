@@ -1,4 +1,4 @@
-# kebabify
+# kebabify (NOT USABLE YET)
 
 Spicetify-like patcher for the Spotify desktop client: ad-free playback, lossless (FLAC) audio via the [lucida.to](https://lucida.to) API with JioSaavn fallback, and a small theme/extension bundle.
 
