@@ -519,7 +519,7 @@ async fn interactive_menu() -> Result<()> {
             MenuChoice::Quit => unreachable!(),
         };
         if let Err(e) = result {
-            println!("Error: {:#}", e);
+            println!("Erreur : {:#}", e);
         }
     }
     Ok(())
