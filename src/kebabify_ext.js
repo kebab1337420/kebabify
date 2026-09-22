@@ -27,6 +27,10 @@
     var playbarInterval = null;
     var flacVerified = false;
     var proxyAlive = false;
+    // True when the verified stream is Saavn AAC-320 rather than FLAC.
+    var aacVerified = false;
+    // Last proxy hint (e.g. 502 "run import-cookies"), surfaced in titles.
+    var lastProxyHint = null;
     // Per-track chatter, off unless explicitly enabled in devtools:
     // window.__kebabifyDebug = true
     function debugLog() {
@@ -46,6 +50,10 @@
     var svgMuted = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
 
     // ===== Proxy Health Check =====
+    // Tracks the serving source too (lucida = FLAC, saavn = 320kbps): a
+    // proxified AAC stream must not light the FLAC ✓.
+    var proxySource = null;
+
     function checkProxyHealth() {
         // Bound the probe: a hung (not dead) proxy must not pile up
         // unresolved health checks every 3 s.
@@ -64,8 +72,10 @@
                 var healthy = alive;
                 resp.json().then(function(data) {
                     if (alive && data && data.flac) healthy = true;
+                    proxySource = (data && data.source) || null;
                     applyProxyHealth(healthy);
                 }).catch(function() {
+                    proxySource = null;
                     applyProxyHealth(alive);
                 });
             })
@@ -73,6 +83,7 @@
                 if (timer) { clearTimeout(timer); timer = null; }
                 // CSP or network error — never assume a leftover proxified src
                 // proves the proxy is alive. Honest "down" beats a green lie.
+                proxySource = null;
                 applyProxyHealth(false);
             });
     }
@@ -214,10 +225,14 @@
                     return originalFetch.call(self, input, init).then(function(resp) {
                         // Proxy failure (lucida down, missing cookies…) → retry
                         // the native input once so the track still plays, in
-                        // Spotify quality, instead of erroring out.
+                        // Spotify quality, instead of erroring out. The 502
+                        // hint (e.g. "run import-cookies") is surfaced on the
+                        // badge title so the failure is diagnosable in-app.
                         if (flacPriority && resp && resp.status === 502 && wasProxified && originalUrl && originalUrl !== urlString(input)) {
                             console.warn('[kebabify] Proxy 502, falling back to native audio');
                             flacVerified = false;
+                            aacVerified = false;
+                            surfaceProxyHint(resp);
                             refreshBadge();
                             return originalFetch.call(self, originalInput, init);
                         }
@@ -285,6 +300,21 @@
 
     function urlString(input) {
         return typeof input === 'string' ? input : (input && input.url) || '';
+    }
+
+    // Reads a proxy 502 JSON body for its `hint` and pins it on the badge
+    // title + remembers it: the one place the failure reason is visible
+    // without devtools. Best-effort, never throws.
+    function surfaceProxyHint(resp) {
+        try {
+            resp.clone().json().then(function(data) {
+                if (data && data.hint) {
+                    lastProxyHint = String(data.hint);
+                    var badge = document.getElementById('kebabify-badge');
+                    if (badge) badge.title = lastProxyHint;
+                }
+            }).catch(function() {});
+        } catch(e) {}
     }
 
     function isProxifiedUrl(input) {
@@ -427,6 +457,7 @@
             if (media._kebabifyOriginalSrc && media.src && media.src.indexOf(PROXY_AUTH) !== -1) {
                 console.warn('[kebabify] Proxy media failed, falling back to native audio');
                 flacVerified = false;
+                aacVerified = false;
                 refreshBadge();
                 media._kebabifyFallbackAt = Date.now();
                 media._kebabifyFallbackTrack = currentSpotifyTrackId;
@@ -546,10 +577,12 @@
     function updateBadgeContent(el) {
         if (!el) return;
         var icon, label, title;
+        // Source-aware: a verified Saavn stream shows 320, never the FLAC ✓.
+        var aac = flacVerified && aacVerified;
         if (flacPriority && proxyAlive && flacVerified) {
             icon = svgCheck;
-            label = 'KB';
-            title = '\u2713 FLAC \u2014 kebabify';
+            label = aac ? '320' : 'KB';
+            title = aac ? '\u266A 320kbps (Saavn) \u2014 kebabify' : '\u2713 FLAC \u2014 kebabify';
             el.className = 'flac-on verified';
         } else if (flacPriority && proxyAlive) {
             icon = svgSpeaker;
@@ -604,6 +637,7 @@
         var badge = document.getElementById('kebabify-badge');
         if (badge) {
             badge.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
+            updateBadgeContent(badge);
         }
         if (playbarButton && playbarButton.element) {
             playbarButton.element.setAttribute('data-kebabify-verified', flacVerified ? 'true' : 'false');
@@ -680,14 +714,17 @@
                 }
                 // Verdict: a proxified stream in flight always wins — a
                 // secondary non-proxified element (preview, ad) must not
-                // flash the badge off while FLAC is actually playing.
+                // flash the badge off while audio is actually proxified.
+                // Source-aware: Saavn AAC lights the 320 state, never FLAC ✓.
                 if (proxifiedPlaying) {
                     if (flacPriority && !flacVerified) {
                         flacVerified = true;
+                        aacVerified = proxySource === 'saavn';
                         updateVerifiedIndicator();
                     }
                 } else if (anyPlaying && flacPriority && flacVerified) {
                     flacVerified = false;
+                    aacVerified = false;
                     updateVerifiedIndicator();
                 }
                 if (!anyPlaying) lastTrackId = null;

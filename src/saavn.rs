@@ -73,11 +73,15 @@ fn cache_is_fresh(at: std::time::Instant) -> bool {
 
 fn store_cdn_url(track_id: &str, url: String) {
     if let Ok(mut guard) = CDN_CACHE.lock() {
-        // Sweep expired, then hard-cap: unbounded growth over weeks of
-        // distinct tracks is a slow leak for a daemon-shaped proxy.
+        // Sweep expired, then halve on overflow (never drop everything at
+        // once: that would thundering-herd the upstreams on re-resolve).
         guard.retain(|_, (_, at)| cache_is_fresh(*at));
         if guard.len() >= 512 {
-            guard.clear();
+            let drop_n = guard.len() / 2;
+            let keys: Vec<String> = guard.keys().take(drop_n).cloned().collect();
+            for k in keys {
+                guard.remove(&k);
+            }
         }
         guard.insert(track_id.to_string(), (url, std::time::Instant::now()));
     }
