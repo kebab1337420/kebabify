@@ -15,6 +15,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --all-targets -- -D warnings
+      # The rusqlite feature gate must compile (and test) on its own.
+      - run: cargo check --no-default-features --locked
+      - run: cargo test --no-default-features --locked
 
   # Validates what releases actually ship (release profile: LTO, strip,
   # panic=abort). Slower, so a separate job that never blocks `check`.

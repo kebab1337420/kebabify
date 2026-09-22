@@ -15,9 +15,9 @@
 //! The User-Agent of the same browser is captured too, because Cloudflare
 //! pins `cf_clearance` to it.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -87,15 +87,38 @@ impl Cdp {
     }
 }
 
-/// Main entry point for `kebabify import-cookies`.
+/// Main entry point for `kebabify import-cookies`. Tries every candidate in
+/// order (default browser first): a failing launch falls through to the next
+/// installed browser instead of aborting the whole flow.
 pub async fn import_from_browser() -> Result<()> {
-    let found = find_browser().context(
-        "No supported browser found (Chrome, Edge, Brave, Vivaldi, Opera, Firefox, Zen, LibreWolf, Waterfox)",
-    )?;
-    match found.kind {
-        BrowserKind::Chromium => import_chromium(&found.exe).await,
-        BrowserKind::FirefoxFamily { label } => import_firefox(&found.exe, label).await,
+    let candidates = browser_candidates();
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "No supported browser found (Chrome, Edge, Brave, Vivaldi, Opera, Firefox, Zen, LibreWolf, Waterfox)"
+        ));
     }
+    let mut last_err = String::new();
+    for found in &candidates {
+        let attempt = match found.kind {
+            BrowserKind::Chromium => import_chromium(&found.exe).await,
+            BrowserKind::FirefoxFamily { label } => import_firefox(&found.exe, label).await,
+        };
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("{:#}", e);
+                eprintln!(
+                    "[kebabify] Import via {} failed — trying the next browser: {}",
+                    found.exe.display(),
+                    last_err
+                );
+            }
+        }
+    }
+    Err(anyhow!(
+        "All browsers failed to import cookies: {}",
+        last_err
+    ))
 }
 
 /// A located browser executable and how to talk to it.
@@ -112,10 +135,49 @@ enum BrowserKind {
     FirefoxFamily { label: &'static str },
 }
 
+/// Removes `dir` when dropped: a failed spawn or early `?` return must not
+/// leak the throwaway profile. The success path removes it explicitly too —
+/// double remove is a swallowed no-op.
+fn scope_cleanup(dir: &Path) -> impl Drop {
+    struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    Guard(dir.to_path_buf())
+}
+
 /// Chromium path for `import-cookies` (CDP flow).
 async fn import_chromium(browser: &Path) -> Result<()> {
+    // A picked-then-bound debug port can be stolen in between (localhost-only,
+    // microseconds): retry the whole launch with a fresh port instead of
+    // failing the 10-minute user flow on a microsecond race.
+    let mut last_err = String::new();
+    for _ in 0..3 {
+        match import_chromium_once(browser).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("{:#}", e);
+                eprintln!(
+                    "[kebabify] Chromium launch attempt failed — retrying: {}",
+                    last_err
+                );
+            }
+        }
+    }
+    Err(anyhow!(
+        "Chromium launch failed after retries: {}",
+        last_err
+    ))
+}
+
+async fn import_chromium_once(browser: &Path) -> Result<()> {
     let port = free_port().context("Could not reserve a debug port")?;
     let profile = temp_profile_dir()?;
+    // Scope guard: a failed spawn (`?` below) must not leak the throwaway
+    // profile dir — the tail cleanup only runs on the success path.
+    let _cleanup = scope_cleanup(&profile);
     let label = browser_label(browser);
     println!(
         "Opening a fresh {} window on lucida.to (port {} for cookies)...",
@@ -130,7 +192,7 @@ async fn import_chromium(browser: &Path) -> Result<()> {
 
     let result = async {
         let ws_url = ws_url.ok_or_else(|| {
-            anyhow!("Chrome started but no lucida.to page appeared within {}s", CHROME_START_TIMEOUT.as_secs())
+            anyhow!("{} started but no lucida.to page appeared within {}s", label, CHROME_START_TIMEOUT.as_secs())
         })?;
 
         let mut cdp = Cdp::connect(&ws_url).await?;
@@ -161,7 +223,21 @@ async fn import_chromium(browser: &Path) -> Result<()> {
 /// profile is opened on lucida.to and its `cookies.sqlite` is polled until
 /// the challenge cookies land.
 async fn import_firefox(exe: &Path, label: &str) -> Result<()> {
+    #[cfg(feature = "firefox-import")]
+    return import_firefox_impl(exe, label).await;
+    #[cfg(not(feature = "firefox-import"))]
+    {
+        let _ = (exe, label);
+        Err(anyhow!(
+            "Firefox cookie import is disabled in this build — rebuild with default features"
+        ))
+    }
+}
+
+#[cfg(feature = "firefox-import")]
+async fn import_firefox_impl(exe: &Path, label: &str) -> Result<()> {
     let profile = temp_profile_dir()?;
+    let _cleanup = scope_cleanup(&profile);
     println!(
         "Opening a fresh {} window on lucida.to (throwaway profile)...",
         label
@@ -232,6 +308,7 @@ async fn wait_for_profile_lock(profile: &Path) -> Result<()> {
 /// Polls the throwaway profile's cookie store until `cf_clearance` appears.
 /// Transient store hiccups (AV scan, WAL checkpoint) skip the tick instead
 /// of aborting the whole 10-minute wait.
+#[cfg(feature = "firefox-import")]
 async fn poll_firefox_cookies(profile: &Path) -> Result<String> {
     let deadline = std::time::Instant::now() + CHALLENGE_TIMEOUT;
     while std::time::Instant::now() < deadline {
@@ -251,6 +328,7 @@ async fn poll_firefox_cookies(profile: &Path) -> Result<String> {
 /// Copies the profile's `cookies.sqlite` aside (the live file may be
 /// locked/WAL-mode) and returns the `Cookie` header value when it holds
 /// `cf_clearance`. `Ok(None)` = not there yet.
+#[cfg(feature = "firefox-import")]
 fn read_firefox_cookies(profile: &Path) -> Result<Option<String>> {
     let src = profile.join("cookies.sqlite");
     if !src.exists() {
@@ -268,10 +346,16 @@ fn read_firefox_cookies(profile: &Path) -> Result<Option<String>> {
         }
     }
     let out = query_cookie_header(&scratch);
-    let _ = std::fs::remove_file(&scratch);
+    // Remove the main copy AND the -wal/-shm scratch copies: each poll tick
+    // copies all three, but only the main one was ever deleted.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ =
+            std::fs::remove_file(profile.join(format!("kebabify-cookies-copy.sqlite{}", suffix)));
+    }
     out
 }
 
+#[cfg(feature = "firefox-import")]
 fn query_cookie_header(db: &Path) -> Result<Option<String>> {
     let conn =
         rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -305,6 +389,8 @@ fn query_cookie_header(db: &Path) -> Result<Option<String>> {
 /// whose `application.ini` carries the product version instead), falling back
 /// to `application.ini`'s `Version` (== Gecko for stock Firefox).
 /// Pure parsers tested below; file IO stays in the caller.
+/// (Unused when `firefox-import` is off — the sqlite path is gone with it.)
+#[cfg_attr(not(feature = "firefox-import"), allow(dead_code))]
 fn firefox_user_agent(exe: &Path) -> Result<String> {
     let dir = exe.parent().context("Browser path has no parent dir")?;
     if let Ok(platform) = std::fs::read_to_string(dir.join("platform.ini")) {
@@ -528,12 +614,21 @@ fn known_browser_layouts() -> Vec<(Vec<&'static str>, &'static str, BrowserKind)
     ]
 }
 
-fn find_browser() -> Option<FoundBrowser> {
+/// Every installed candidate in priority order (default browser first, then
+/// install scan, registry, PATH), deduped by exe path. Powers both the
+/// first-pick shortcut and the try-each fallback in `import_from_browser`.
+fn browser_candidates() -> Vec<FoundBrowser> {
+    let mut out: Vec<FoundBrowser> = Vec::new();
+    let mut push = |exe: PathBuf, kind: BrowserKind| {
+        if !out.iter().any(|f: &FoundBrowser| f.exe == exe) {
+            out.push(FoundBrowser { exe, kind });
+        }
+    };
     // The user's default browser first — not whatever happens to be
     // installed first in our scan order.
     #[cfg(target_os = "windows")]
     if let Some(found) = default_browser() {
-        return Some(found);
+        push(found.exe, found.kind);
     }
     for var in [
         "PROGRAMFILES",
@@ -552,12 +647,12 @@ fn find_browser() -> Option<FoundBrowser> {
             }
             let path = path.join(exe);
             if path.exists() {
-                return Some(FoundBrowser { exe: path, kind });
+                push(path, kind);
             }
         }
     }
-    if let Some(exe) = find_browser_registry() {
-        return Some(exe);
+    if let Some(found) = find_browser_registry() {
+        push(found.exe, found.kind);
     }
     // PATH fallback, Chromium first for the same CDP-first reason.
     for name in [
@@ -574,32 +669,44 @@ fn find_browser() -> Option<FoundBrowser> {
         "waterfox",
     ] {
         if let Ok(path) = which::which(name) {
-            return Some(FoundBrowser {
-                kind: classify_exe(&path),
-                exe: path,
-            });
+            let kind = classify_exe(&path);
+            push(path, kind);
         }
     }
-    None
+    out
 }
 
 /// Best-effort kind from an exe file name (registry/PATH hits).
 fn classify_exe(path: &Path) -> BrowserKind {
+    classify_exe_opt(path).unwrap_or(BrowserKind::Chromium)
+}
+
+/// `None` for an unrecognized browser (Safari, Thorium, a WebView stub…):
+/// callers that must not guess (the default-browser fast path) fall through
+/// to the scan instead of launching unknown flags at it.
+fn classify_exe_opt(path: &Path) -> Option<BrowserKind> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
     if name.contains("firefox") {
-        BrowserKind::FirefoxFamily { label: "Firefox" }
+        Some(BrowserKind::FirefoxFamily { label: "Firefox" })
     } else if name.contains("zen") {
-        BrowserKind::FirefoxFamily { label: "Zen" }
+        Some(BrowserKind::FirefoxFamily { label: "Zen" })
     } else if name.contains("librewolf") {
-        BrowserKind::FirefoxFamily { label: "LibreWolf" }
+        Some(BrowserKind::FirefoxFamily { label: "LibreWolf" })
     } else if name.contains("waterfox") {
-        BrowserKind::FirefoxFamily { label: "Waterfox" }
+        Some(BrowserKind::FirefoxFamily { label: "Waterfox" })
+    } else if [
+        "chrome", "chromium", "msedge", "edge", "brave", "vivaldi", "opera", "arc",
+    ]
+    .iter()
+    .any(|k| name.contains(k))
+    {
+        Some(BrowserKind::Chromium)
     } else {
-        BrowserKind::Chromium
+        None
     }
 }
 
@@ -629,10 +736,13 @@ fn default_browser() -> Option<FoundBrowser> {
             if let Ok(cmd) = cmd_key.get_value::<String, _>("") {
                 if let Some(exe) = parse_exe_from_command(&cmd) {
                     if exe.exists() {
-                        return Some(FoundBrowser {
-                            kind: classify_exe(&exe),
-                            exe,
-                        });
+                        // Unknown default (not a Chromium/Firefox family we
+                        // know the flags for): decline and let the install
+                        // scan pick a browser we can actually drive.
+                        if let Some(kind) = classify_exe_opt(&exe) {
+                            return Some(FoundBrowser { kind, exe });
+                        }
+                        return None;
                     }
                 }
             }
@@ -643,7 +753,8 @@ fn default_browser() -> Option<FoundBrowser> {
 }
 
 /// Extracts the exe path from an open-command string:
-/// `"C:\a\b.exe" --args %1` or `C:\a\b.exe -url %1`. Pure for tests.
+/// `"C:\a\b.exe" --args %1`, `C:\a\b.exe -url %1`, or a bare `C:\a\b.exe`
+/// (legal, no `%1`/args). Pure for tests.
 fn parse_exe_from_command(cmd: &str) -> Option<PathBuf> {
     let cmd = cmd.trim();
     if let Some(rest) = cmd.strip_prefix('"') {
@@ -653,11 +764,23 @@ fn parse_exe_from_command(cmd: &str) -> Option<PathBuf> {
         }
         return Some(PathBuf::from(rest[..end].trim()));
     }
-    let end = cmd.find(char::is_whitespace)?;
-    if cmd[..end].trim().is_empty() {
-        return None;
+    match cmd.find(char::is_whitespace) {
+        Some(end) => {
+            if cmd[..end].trim().is_empty() {
+                return None;
+            }
+            Some(PathBuf::from(cmd[..end].trim()))
+        }
+        // No whitespace at all: a bare exe path, accepted only when it
+        // actually looks like one (guards against swallowing garbage).
+        None => {
+            if !cmd.is_empty() && cmd.to_lowercase().ends_with(".exe") {
+                Some(PathBuf::from(cmd))
+            } else {
+                None
+            }
+        }
     }
-    Some(PathBuf::from(cmd[..end].trim()))
 }
 
 /// Display name for launch messages, from the exe file name.
@@ -867,6 +990,27 @@ mod tests {
         assert_eq!(parse_exe_from_command(""), None);
         assert_eq!(parse_exe_from_command("\"\""), None);
         assert_eq!(parse_exe_from_command("   "), None);
+        // Bare exe with no args (legal open\command): accepted…
+        assert_eq!(
+            parse_exe_from_command("C:\\Firefox\\firefox.exe"),
+            Some(PathBuf::from("C:\\Firefox\\firefox.exe"))
+        );
+        // …but bare garbage is not an exe.
+        assert_eq!(parse_exe_from_command("firefox"), None);
+    }
+
+    #[test]
+    fn unknown_exe_declines_classification() {
+        assert!(classify_exe_opt(&PathBuf::from("C:\\x\\thorium.exe")).is_none());
+        assert!(classify_exe_opt(&PathBuf::from("C:\\x\\safari.exe")).is_none());
+        assert!(matches!(
+            classify_exe_opt(&PathBuf::from("C:\\x\\msedge.exe")),
+            Some(BrowserKind::Chromium)
+        ));
+        assert!(matches!(
+            classify_exe_opt(&PathBuf::from("C:\\x\\waterfox.exe")),
+            Some(BrowserKind::FirefoxFamily { .. })
+        ));
     }
 
     #[test]
@@ -913,6 +1057,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "firefox-import")]
     fn firefox_cookies_filtered_like_cdp() {
         let dir = std::env::temp_dir().join(format!("kebabify_sqlite_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -938,6 +1083,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "firefox-import")]
     fn firefox_cookies_missing_clearance_is_none() {
         let dir =
             std::env::temp_dir().join(format!("kebabify_sqlite_test2_{}", std::process::id()));

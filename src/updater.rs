@@ -8,7 +8,7 @@
 //! Spotify itself keeps running with the old extension until the user
 //! restarts it — the badge says so.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// GitHub API endpoint listing the latest release.
 const RELEASES_LATEST: &str = "https://api.github.com/repos/kebab1337420/kebabify/releases/latest";
@@ -21,15 +21,50 @@ const SHA_ASSET_NAME: &str = "kebabify.exe.sha256";
 
 /// Hosts a release download may come from (TLS protects the rest; this pins
 /// the trust root so a poisoned JSON payload can't point us anywhere else).
+/// `github.com` URLs are additionally path-pinned to our repo's download
+/// tree, so a payload pointing at an attacker's own repo fails too;
+/// `objects.githubusercontent.com` serves opaque signed URLs (no stable path
+/// to pin — the host pin is the check there).
 fn pinned_url(raw: &str) -> Result<url::Url> {
     let url = url::Url::parse(raw).context("Bad release URL")?;
     if url.scheme() != "https" {
         return Err(anyhow!("Release URL is not https"));
     }
     match url.host_str() {
-        Some("github.com") | Some("objects.githubusercontent.com") => Ok(url),
+        Some("github.com") => {
+            if url
+                .path()
+                .starts_with("/kebab1337420/kebabify/releases/download/")
+            {
+                Ok(url)
+            } else {
+                Err(anyhow!("Release URL path not allowed"))
+            }
+        }
+        Some("objects.githubusercontent.com") => Ok(url),
         _ => Err(anyhow!("Release URL host not allowed")),
     }
+}
+
+/// Rejects off-host redirects: after `.send()`, the final URL must either
+/// still pass [`pinned_url`] or share the original URL's host (reqwest
+/// follows redirects by default, and only the JSON URL was pinned before).
+fn redirect_ok(original: &str, resp: &reqwest::Response) -> Result<()> {
+    let before = url::Url::parse(original).context("Bad release URL")?;
+    let after = resp.url();
+    if redirect_target_ok(&before, after) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Release download redirected off-host: {}",
+            after.host_str().unwrap_or("?")
+        ))
+    }
+}
+
+/// Pure core of [`redirect_ok`], unit-testable without a response.
+fn redirect_target_ok(before: &url::Url, after: &url::Url) -> bool {
+    after.host_str() == before.host_str() || pinned_url(after.as_str()).is_ok()
 }
 
 /// How long an update check stays cached (GitHub rate-limits anonymous API
@@ -148,7 +183,9 @@ async fn download_inner(
         .header("Accept", "application/octet-stream")
         .send()
         .await
-        .context("Update download failed")?
+        .context("Update download failed")?;
+    redirect_ok(&info.download_url, &resp)?;
+    resp = resp
         .error_for_status()
         .context("Update download returned an error")?;
     let mut file =
@@ -168,24 +205,29 @@ async fn download_inner(
     Ok(())
 }
 
-/// Verifies the downloaded file against the release's sha256 sidecar when
-/// present (fail-closed); without a sidecar there is nothing to check
-/// against (older releases), so it passes with TLS-only trust.
+/// Verifies the downloaded file against the release's sha256 sidecar,
+/// fail-closed: a release without a sidecar is refused (a poisoned payload
+/// would simply omit it). Sidecars are published since v0.6.0.
 async fn verify_checksum(
     client: &reqwest::Client,
     info: &ReleaseInfo,
     dest: &std::path::Path,
 ) -> Result<()> {
     let Some(sha_url) = info.sha_url.as_deref() else {
-        return Ok(());
+        let _ = std::fs::remove_file(dest);
+        return Err(anyhow!(
+            "Release has no checksum sidecar — refusing an unverifiable binary"
+        ));
     };
-    let body = client
+    let resp = client
         .get(sha_url)
         .timeout(std::time::Duration::from_secs(15))
         .header("User-Agent", crate::lucida::STOCK_UA)
         .send()
         .await
-        .context("Checksum download failed")?
+        .context("Checksum download failed")?;
+    redirect_ok(sha_url, &resp)?;
+    let body = resp
         .error_for_status()
         .context("Checksum download error")?
         .text()
@@ -233,12 +275,15 @@ pub fn stage_and_relaunch(current_exe: &std::path::Path, staged: &std::path::Pat
     {
         use std::os::windows::process::CommandExt;
         // `timeout` + `move` + `start`: the helper outlives us, so the dead
-        // binary can be replaced. Quoted paths survive spaces; no console.
+        // binary can be replaced. Quoted paths survive spaces; `%` is doubled
+        // because cmd.exe expands %VAR% even inside quotes. No console.
+        // A failed `move` still launches the old binary (acceptable fallback).
+        let escape = |p: &std::path::Path| p.display().to_string().replace('%', "%%");
         let script = format!(
             "timeout /t 3 /nobreak >nul & move /Y \"{}\" \"{}\" & start \"\" \"{}\" apply",
-            staged.display(),
-            current_exe.display(),
-            current_exe.display()
+            escape(staged),
+            escape(current_exe),
+            escape(current_exe)
         );
         let mut cmd = std::process::Command::new("cmd.exe");
         cmd.args(["/C", &script]);
@@ -291,7 +336,12 @@ mod tests {
         });
         let r = find_release(&payload, "0.4.0").unwrap();
         assert_eq!(r.version, "0.5.0");
-        assert_eq!(r.sha_url.as_deref(), Some("https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe.sha256"));
+        assert_eq!(
+            r.sha_url.as_deref(),
+            Some(
+                "https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe.sha256"
+            )
+        );
 
         assert!(find_release(&payload, "0.5.0").is_none());
         assert!(find_release(&payload, "0.9.0").is_none());
@@ -308,14 +358,64 @@ mod tests {
 
     #[test]
     fn hosts_pinned() {
-        assert!(pinned_url(
-            "https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe"
-        )
-        .is_ok());
+        assert!(
+            pinned_url(
+                "https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe"
+            )
+            .is_ok()
+        );
         assert!(pinned_url("https://objects.githubusercontent.com/x/y").is_ok());
         assert!(pinned_url("http://github.com/x").is_err());
         assert!(pinned_url("https://evil.com/kebabify.exe").is_err());
         assert!(pinned_url("not a url").is_err());
+        // Attacker's own repo passes the host pin but fails the path pin.
+        assert!(
+            pinned_url("https://github.com/attacker/evil/releases/download/v9/kebabify.exe")
+                .is_err()
+        );
+        // Poisoned payload with attacker's repo: rejected in find_release too.
+        let evil_repo = serde_json::json!({
+            "tag_name": "v0.9.9",
+            "assets": [{"name": "kebabify.exe", "browser_download_url": "https://github.com/attacker/evil/releases/download/v0.9.9/kebabify.exe"}],
+        });
+        assert!(find_release(&evil_repo, "0.4.0").is_none());
+    }
+
+    #[test]
+    fn redirect_stays_on_host() {
+        let dl = url::Url::parse(
+            "https://github.com/kebab1337420/kebabify/releases/download/v0.6.0/kebabify.exe",
+        )
+        .unwrap();
+        // Same host after a (signed-URL) hop: fine.
+        let same = url::Url::parse("https://github.com/other/path/file.exe").unwrap();
+        assert!(redirect_target_ok(&dl, &same));
+        // Hop onto the CDN host: still pinned.
+        let cdn = url::Url::parse("https://objects.githubusercontent.com/abc").unwrap();
+        assert!(redirect_target_ok(&dl, &cdn));
+        // Hop off-host entirely: rejected.
+        let evil = url::Url::parse("https://evil.com/kebabify.exe").unwrap();
+        assert!(!redirect_target_ok(&dl, &evil));
+    }
+
+    /// Fail-closed: a payload without a checksum sidecar refuses the binary
+    /// and leaves no file behind.
+    #[tokio::test]
+    async fn download_without_sidecar_refused() {
+        let payload = vec![65u8; 2048];
+        let mock = MockServer::start(vec![Route::new("/file", vec![(200, payload)])]).await;
+        let client = reqwest::Client::new();
+        let dir = std::env::temp_dir().join(format!("kebabify_nosha_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let info = ReleaseInfo {
+            version: "9.9.9".to_string(),
+            download_url: format!("{}/file", mock.base_url),
+            sha_url: None,
+        };
+        let dest = dir.join("kebabify.exe.new");
+        assert!(download_release(&client, &info, &dest).await.is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use crate::mock::{MockServer, Route};

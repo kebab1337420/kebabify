@@ -8,7 +8,7 @@
 //! (`blockAds`) rather than by binary-patching the minified JS bundles, which
 //! previously NOP'd bytes and could produce invalid JavaScript.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 /// The patcher instance — holds paths for the Spotify install and user data.
@@ -312,6 +312,23 @@ impl SpotifyPatcher {
         content.push_str(&format!("{}\n{}\n{}\n", marker, css, end_marker));
 
         std::fs::write(&css_path, &content).context("Failed to inject CSS theme")?;
+        // TOCTOU guard: Spotify self-update (or a parallel apply) may have
+        // replaced the file between our read and write. Re-read and retry
+        // once from fresh content; abort rather than ship a stale mix.
+        let back = std::fs::read_to_string(&css_path).unwrap_or_default();
+        if back != content {
+            let mut fresh = back;
+            strip_theme_blocks(&mut fresh);
+            if !fresh.is_empty() && !fresh.ends_with('\n') {
+                fresh.push('\n');
+            }
+            fresh.push_str(&format!("{}\n{}\n{}\n", marker, css, end_marker));
+            std::fs::write(&css_path, &fresh).context("Failed to re-inject CSS theme")?;
+            let again = std::fs::read_to_string(&css_path).unwrap_or_default();
+            if again != fresh {
+                anyhow::bail!("user.css changed under us — aborting patch");
+            }
+        }
 
         eprintln!("  Injected: user.css (theme applied)");
         Ok(())
@@ -347,6 +364,22 @@ impl SpotifyPatcher {
         }
 
         std::fs::write(&index_path, &content).context("Failed to write patched index.html")?;
+        // TOCTOU guard, same as CSS above: re-read, retry once, else abort.
+        let back = std::fs::read_to_string(&index_path).unwrap_or_default();
+        if back != content {
+            let mut fresh = back;
+            strip_extension_scripts(&mut fresh);
+            if let Some(pos) = fresh.find("</body>") {
+                fresh.insert_str(pos, &inline_script);
+            } else {
+                fresh.push_str(&inline_script);
+            }
+            std::fs::write(&index_path, &fresh).context("Failed to rewrite patched index.html")?;
+            let again = std::fs::read_to_string(&index_path).unwrap_or_default();
+            if again != fresh {
+                anyhow::bail!("index.html changed under us — aborting patch");
+            }
+        }
 
         eprintln!("  Injected: index.html (JS extension loaded)");
         eprintln!("  Written: ext/kebabify_ext.js");
@@ -696,7 +729,9 @@ mod tests {
 
     #[test]
     fn strips_both_theme_names_without_removing_user_css() {
-        let mut content = String::from("body {}\n/* kebaccify_start */old/* kebaccify_end *//* kebabify_start */new/* kebabify_end */p {}");
+        let mut content = String::from(
+            "body {}\n/* kebaccify_start */old/* kebaccify_end *//* kebabify_start */new/* kebabify_end */p {}",
+        );
         strip_theme_blocks(&mut content);
         assert_eq!(content, "body {}\np {}");
         strip_theme_blocks(&mut content);

@@ -60,6 +60,17 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 `cargo test --locked` and the same three checks run in CI on every push/PR.
+The Firefox cookie import is behind the `firefox-import` feature (bundled
+SQLite, on by default): `cargo test --no-default-features --locked` proves
+the lean build compiles too. Windows binaries embed `icons/icon.ico` at
+build time (winres).
+
+## Shutdown token
+
+`/shutdown` on the audio proxy needs a per-boot token (an Origin header is
+forgeable by any local process). The proxy mints `%APPDATA%\Kebabify\shutdown.token`
+on start; the CLI attaches it automatically, so nothing changes for the
+user. The token is deleted on `uninstall`.
 
 ## Troubleshooting
 

@@ -26,6 +26,7 @@ mod browser_import;
 mod lucida;
 mod patcher;
 mod saavn;
+mod shutdown_token;
 mod soulseek;
 mod updater;
 
@@ -316,13 +317,9 @@ fn require_patcher() -> Result<patcher::SpotifyPatcher> {
 async fn cmd_uninstall() -> Result<()> {
     println!("kebabify — removing patches...");
     stop_proxy().await;
-    match require_patcher() {
-        Ok(p) => {
-            p.uninstall_patches()?;
-            println!("Patches removed. Spotify restored to original.");
-        }
-        Err(e) => return Err(e),
-    }
+    // Our own leftovers are cleaned even when Spotify is missing or broken
+    // (precisely when a stale log/staged binary is most likely): remove them
+    // before the patcher gate below can early-return.
     // The debug log is ours, not the user's: remove it for a clean
     // reinstall. Cookies are kept — they cost a challenge to obtain.
     if let Some(dir) = lucida::cookies_file_path().parent() {
@@ -330,6 +327,12 @@ async fn cmd_uninstall() -> Result<()> {
         if log.exists() {
             let _ = std::fs::remove_file(&log);
             eprintln!("  Removed: proxy log");
+        }
+        // The shutdown token dies with the install (a fresh apply mints one).
+        let token = dir.join("shutdown.token");
+        if token.exists() {
+            let _ = std::fs::remove_file(&token);
+            eprintln!("  Removed: shutdown token");
         }
     }
     // A failed update may leave a staged kebabify.exe.new behind.
@@ -339,6 +342,13 @@ async fn cmd_uninstall() -> Result<()> {
             let _ = std::fs::remove_file(&staged);
             eprintln!("  Removed: staged update");
         }
+    }
+    match require_patcher() {
+        Ok(p) => {
+            p.uninstall_patches()?;
+            println!("Patches removed. Spotify restored to original.");
+        }
+        Err(e) => return Err(e),
     }
     Ok(())
 }
@@ -465,7 +475,11 @@ async fn cmd_cookie_prompt() -> Result<()> {
             answer.trim().to_lowercase().as_str(),
             "o" | "oui" | "y" | "yes"
         ) {
-            println!("Abandonné — session existante conservée.");
+            if lucida::has_cf_clearance() {
+                println!("Abandonné — session existante conservée.");
+            } else {
+                println!("Abandonné — aucune session stockée (FLAC indisponible).");
+            }
             return Ok(());
         }
         return cmd_cookie(ua, cookie, true).await;
@@ -569,8 +583,8 @@ fn parse_menu_choice(line: &str) -> Option<MenuChoice> {
         "a" | "appliquer" | "apply" => Some(MenuChoice::Apply),
         "r" | "run" | "lancer" => Some(MenuChoice::Run),
         "d" | "desinstaller" | "désinstaller" | "uninstall" => Some(MenuChoice::Uninstall),
-        "u" | "update-ext" => Some(MenuChoice::UpdateExt),
-        "m" | "mettre" | "maj" | "update" | "upgrade" => Some(MenuChoice::Update),
+        "u" | "update-ext" | "extensions" => Some(MenuChoice::UpdateExt),
+        "m" | "mettre" | "maj" | "upgrade" => Some(MenuChoice::Update),
         "s" | "statut" | "status" => Some(MenuChoice::Status),
         "i" | "importer" | "import" | "import-cookies" => Some(MenuChoice::ImportCookies),
         "c" | "cookie" | "manuel" => Some(MenuChoice::CookieManual),
@@ -589,7 +603,7 @@ async fn interactive_menu() -> Result<()> {
         println!("  [A]ppliquer le patch (+ lancer Spotify)");
         println!("  [R]un supervisé (proxy lié à Spotify)");
         println!("  [D]ésinstaller (restaurer Spotify)");
-        println!("  [U]pdate extensions");
+        println!("  [U] Extensions (mettre à jour)");
         println!("  [M]ettre à jour kebabify");
         println!("  [S]tatut");
         println!("  [I]mporter les cookies (Cloudflare)");
@@ -686,8 +700,11 @@ mod tests {
         assert_eq!(parse_menu_choice("d"), Some(Uninstall));
         assert_eq!(parse_menu_choice("DÉSINSTALLER"), Some(Uninstall));
         assert_eq!(parse_menu_choice("u"), Some(UpdateExt));
+        assert_eq!(parse_menu_choice("extensions"), Some(UpdateExt));
         assert_eq!(parse_menu_choice("m"), Some(Update));
-        assert_eq!(parse_menu_choice("update"), Some(Update));
+        assert_eq!(parse_menu_choice("upgrade"), Some(Update));
+        // `update` alone means extensions (it matches the [U] menu letter).
+        assert_eq!(parse_menu_choice("update"), None);
         assert_eq!(parse_menu_choice("s"), Some(Status));
         assert_eq!(parse_menu_choice("i"), Some(ImportCookies));
         assert_eq!(parse_menu_choice("c"), Some(CookieManual));
