@@ -22,7 +22,7 @@
 //! - One P2P run at a time (Soulseek kicks concurrent logins).
 //! - Files are validated before serving; garbage is deleted, not served.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 /// A resolved, cached FLAC file ready to be served from disk.
@@ -483,12 +483,16 @@ mod tests {
     fn credentials_roundtrip_and_missing() {
         let dir = temp_flac_dir("creds");
         let file = dir.join("soulseek.txt");
-        std::env::set_var("KEBABIFY_SOULSEEK_CREDS", &file);
+        unsafe {
+            std::env::set_var("KEBABIFY_SOULSEEK_CREDS", &file);
+        }
         assert!(!has_credentials());
         save_credentials("someuser", "s3cr3t!").unwrap();
         let (u, p) = credentials().unwrap();
         assert_eq!((u.as_str(), p.as_str()), ("someuser", "s3cr3t!"));
-        std::env::remove_var("KEBABIFY_SOULSEEK_CREDS");
+        unsafe {
+            std::env::remove_var("KEBABIFY_SOULSEEK_CREDS");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

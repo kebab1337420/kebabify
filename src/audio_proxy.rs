@@ -933,8 +933,6 @@ async fn handle_client(
             write_half.write_all(&chunk).await?;
             total_bytes += chunk.len() as u64;
         }
-            } // end Upstream::Http arm
-        } // end match upstream
 
         write_half.flush().await?;
         eprintln!(
@@ -947,6 +945,8 @@ async fn handle_client(
             tid,
             total_bytes
         );
+            } // end Upstream::Http arm
+        } // end match upstream
 
         Ok(())
     }

@@ -594,8 +594,8 @@ fn extract_page_token(html: &str) -> Option<(Option<String>, u64)> {
 /// Decodes the page token. The lucida client sends `atob(atob(token))`: the
 /// page value is base64-of-base64 (standard alphabet; URL-safe tolerated).
 fn double_b64_decode(s: &str) -> Option<String> {
-    use base64::engine::general_purpose::{STANDARD, URL_SAFE};
     use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 
     let layer1 = STANDARD
         .decode(s.trim())
@@ -713,8 +713,8 @@ mod tests {
 
     #[test]
     fn double_base64_roundtrip() {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
         let once = STANDARD.encode("tok123-primary");
         let twice = STANDARD.encode(&once);
         assert_eq!(double_b64_decode(&twice).as_deref(), Some("tok123-primary"));
@@ -806,8 +806,8 @@ mod tests {
     /// Page token for the mock resolver: twice-base64 of "tok123-primary",
     /// like the real devalue page-data (`token:"…",tokenExpiry:…`).
     fn page_token_twice() -> String {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
         STANDARD.encode(STANDARD.encode("tok123-primary"))
     }
 
@@ -891,7 +891,7 @@ mod tests {
             Route::catch_all(200, resolve_html()),
         ])
         .await;
-// Reserve-then-drop races a port thief (localhost-only, microseconds):
+        // Reserve-then-drop races a port thief (localhost-only, microseconds):
         // retry with a fresh port instead of flaking.
         let client = reqwest::Client::new();
         let mut last = String::new();
@@ -900,7 +900,7 @@ mod tests {
             let ep = LucidaEndpoints {
                 base: mock.base_url.clone(),
                 api_load: format!("{}/api/load", mock.base_url),
-                status_tpl: format!("http://127.0.0.1:{}/status/{{handoff}}", dead),
+                status_base: format!("http://127.0.0.1:{}/status/{{handoff}}", dead),
             };
             let err = open_stream_with(
                 &client,
