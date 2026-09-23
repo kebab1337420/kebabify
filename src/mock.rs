@@ -149,8 +149,7 @@ async fn serve_one(sock: tokio::net::TcpStream, routes: &Arc<Mutex<Vec<Route>>>)
     let (status, body, ranged) = {
         let mut routes = routes.lock().expect("mock routes");
         let hit = routes.iter_mut().find(|r| {
-            path.starts_with(&r.prefix)
-                && r.contains.as_ref().is_none_or(|c| path.contains(c))
+            path.starts_with(&r.prefix) && r.contains.as_ref().is_none_or(|c| path.contains(c))
         });
         match hit {
             Some(route) => {

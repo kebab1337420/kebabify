@@ -119,7 +119,10 @@ async fn open_file_with(
     std::fs::create_dir_all(&staging).context("Soulseek: cannot create staging dir")?;
 
     let args = build_args(&user, &pass, &query, &staging);
-    eprintln!("[kebabify] Soulseek: downloading \"{}\" (P2P, up to 8 min)…", query);
+    eprintln!(
+        "[kebabify] Soulseek: downloading \"{}\" (P2P, up to 8 min)…",
+        query
+    );
     if let Err(e) = run_sockseek(&binary, &staging, &args).await {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e.context(format!("Soulseek: download failed for \"{}\"", query)));
@@ -219,7 +222,9 @@ fn build_args(user: &str, pass: &str, query: &str, staging: &Path) -> Vec<String
 
 /// Song-mode query: artist + title, trimmed. Pure for tests.
 fn search_query(artist: &str, title: &str) -> String {
-    format!("{} {}", artist.trim(), title.trim()).trim().to_string()
+    format!("{} {}", artist.trim(), title.trim())
+        .trim()
+        .to_string()
 }
 
 /// Largest `.flac` under `dir` (recursive). The downloader names files its
@@ -307,9 +312,7 @@ fn binary_name() -> &'static str {
 fn data_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .map(|a| PathBuf::from(a).join("Kebabify"))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kebabify"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kebabify")))
 }
 
 /// Public so `status` and the binary-placement hint agree on the location.
@@ -328,7 +331,8 @@ fn cache_dir() -> PathBuf {
     }
     data_dir()
         .map(|d| d.join("cache"))
-        .unwrap_or_else(|| std::env::temp_dir().join("kebabify-cache"))}
+        .unwrap_or_else(|| std::env::temp_dir().join("kebabify-cache"))
+}
 
 /// Stored login: line 1 = username, line 2 = password. Env pair
 /// (`SOULSEEK_USER` + `SOULSEEK_PASS`) wins when both are set.
@@ -341,8 +345,7 @@ fn credentials() -> Result<(String, String)> {
         _ => {}
     }
     let path = credentials_path()?;
-    let content =
-        std::fs::read_to_string(&path).context("Soulseek: no stored credentials")?;
+    let content = std::fs::read_to_string(&path).context("Soulseek: no stored credentials")?;
     let mut lines = content.lines();
     match (lines.next(), lines.next()) {
         (Some(u), Some(p)) if !u.trim().is_empty() && !p.is_empty() => {
@@ -388,19 +391,34 @@ mod tests {
             search_query("Rick Astley", "Never Gonna Give You Up"),
             "Rick Astley Never Gonna Give You Up"
         );
-        assert_eq!(search_query("  Daft Punk ", " Get Lucky "), "Daft Punk Get Lucky");
+        assert_eq!(
+            search_query("  Daft Punk ", " Get Lucky "),
+            "Daft Punk Get Lucky"
+        );
     }
 
     #[test]
     fn args_carry_security_flags() {
         let args = build_args("u", "p", "Artist Title", Path::new("C:\\stage"));
         let has = |flag: &str| args.iter().any(|a| a == flag);
-        assert!(has("--input-type") && args[args.iter().position(|a| a == "--input-type").unwrap() + 1] == "string");
+        assert!(
+            has("--input-type")
+                && args[args.iter().position(|a| a == "--input-type").unwrap() + 1] == "string"
+        );
         assert!(has("-s"));
-        assert!(has("--format") && args[args.iter().position(|a| a == "--format").unwrap() + 1] == "flac");
+        assert!(
+            has("--format")
+                && args[args.iter().position(|a| a == "--format").unwrap() + 1] == "flac"
+        );
         assert!(has("--no-listen"));
-        assert!(has("--shared-files") && args[args.iter().position(|a| a == "--shared-files").unwrap() + 1] == "0");
-        assert!(has("--shared-folders") && args[args.iter().position(|a| a == "--shared-folders").unwrap() + 1] == "0");
+        assert!(
+            has("--shared-files")
+                && args[args.iter().position(|a| a == "--shared-files").unwrap() + 1] == "0"
+        );
+        assert!(
+            has("--shared-folders")
+                && args[args.iter().position(|a| a == "--shared-folders").unwrap() + 1] == "0"
+        );
         assert!(has("--no-config"));
         assert!(has("--no-write-index"));
     }

@@ -16,6 +16,22 @@ const RELEASES_LATEST: &str = "https://api.github.com/repos/kebab1337420/kebabif
 /// Expected asset name on the release.
 const ASSET_NAME: &str = "kebabify.exe";
 
+/// Checksum sidecar asset name (`"<hex>  kebabify.exe"`).
+const SHA_ASSET_NAME: &str = "kebabify.exe.sha256";
+
+/// Hosts a release download may come from (TLS protects the rest; this pins
+/// the trust root so a poisoned JSON payload can't point us anywhere else).
+fn pinned_url(raw: &str) -> Result<url::Url> {
+    let url = url::Url::parse(raw).context("Bad release URL")?;
+    if url.scheme() != "https" {
+        return Err(anyhow!("Release URL is not https"));
+    }
+    match url.host_str() {
+        Some("github.com") | Some("objects.githubusercontent.com") => Ok(url),
+        _ => Err(anyhow!("Release URL host not allowed")),
+    }
+}
+
 /// How long an update check stays cached (GitHub rate-limits anonymous API
 /// calls to 60/hour/IP — the proxy checks at most every 30 min anyway).
 pub const CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -24,8 +40,10 @@ pub const CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 pub struct ReleaseInfo {
     /// Bare version, e.g. `0.5.0`.
     pub version: String,
-    /// Direct download URL of the exe asset.
+    /// Direct download URL of the exe asset (host-pinned).
     pub download_url: String,
+    /// Checksum sidecar URL, when the release publishes one.
+    pub sha_url: Option<String>,
 }
 
 /// Parses `v0.5.0` / `0.5.0` into `(major, minor, patch)`. Pure.
@@ -81,21 +99,44 @@ fn find_release(json: &serde_json::Value, current: &str) -> Option<ReleaseInfo> 
     if !is_newer(current, tag) {
         return None;
     }
-    let url = json
-        .get("assets")?
-        .as_array()?
+    let assets = json.get("assets")?.as_array()?;
+    let asset = assets
         .iter()
-        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(ASSET_NAME))?
-        .get("browser_download_url")?
-        .as_str()?;
+        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(ASSET_NAME))?;
+    let download_url = asset.get("browser_download_url")?.as_str()?;
+    let sha_url = assets
+        .iter()
+        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(SHA_ASSET_NAME))
+        .and_then(|a| a.get("browser_download_url"))
+        .and_then(|u| u.as_str())
+        .map(str::to_string);
+    // Host-pinned here so a poisoned payload fails before any download.
+    pinned_url(download_url).ok()?;
+    if let Some(ref sha) = sha_url {
+        pinned_url(sha).ok()?;
+    }
     Some(ReleaseInfo {
         version: tag.strip_prefix('v').unwrap_or(tag).to_string(),
-        download_url: url.to_string(),
+        download_url: download_url.to_string(),
+        sha_url,
     })
 }
 
-/// Streams the release asset to `dest`.
+/// Streams the release asset to `dest`, verified when the release publishes
+/// a checksum. A failed download never leaves a partial file behind.
 pub async fn download_release(
+    client: &reqwest::Client,
+    info: &ReleaseInfo,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let result = download_inner(client, info, dest).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+async fn download_inner(
     client: &reqwest::Client,
     info: &ReleaseInfo,
     dest: &std::path::Path,
@@ -120,9 +161,62 @@ pub async fn download_release(
     file.flush().ok();
     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
     if size < 1024 {
+        let _ = std::fs::remove_file(dest);
         return Err(anyhow!("Downloaded update is suspiciously small"));
     }
+    verify_checksum(client, info, dest).await?;
     Ok(())
+}
+
+/// Verifies the downloaded file against the release's sha256 sidecar when
+/// present (fail-closed); without a sidecar there is nothing to check
+/// against (older releases), so it passes with TLS-only trust.
+async fn verify_checksum(
+    client: &reqwest::Client,
+    info: &ReleaseInfo,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let Some(sha_url) = info.sha_url.as_deref() else {
+        return Ok(());
+    };
+    let body = client
+        .get(sha_url)
+        .timeout(std::time::Duration::from_secs(15))
+        .header("User-Agent", crate::lucida::STOCK_UA)
+        .send()
+        .await
+        .context("Checksum download failed")?
+        .error_for_status()
+        .context("Checksum download error")?
+        .text()
+        .await
+        .context("Failed to read checksum")?;
+    let expected = body
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("Checksum file is empty"))?
+        .to_lowercase();
+    if !expected.chars().all(|c| c.is_ascii_hexdigit()) || expected.len() != 64 {
+        return Err(anyhow!("Checksum file is malformed"));
+    }
+    let actual = sha256_file(dest)?;
+    if actual != expected {
+        let _ = std::fs::remove_file(dest);
+        return Err(anyhow!(
+            "Update checksum mismatch — refusing a possibly tampered binary"
+        ));
+    }
+    Ok(())
+}
+
+/// Hex SHA-256 of a file. Pure IO, no network.
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("Cannot hash {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).context("Failed to hash update file")?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// `kebabify.exe` → `kebabify.exe.new` staged next to it.
@@ -190,18 +284,88 @@ mod tests {
         let payload = serde_json::json!({
             "tag_name": "v0.5.0",
             "assets": [
-                {"name": "kebabify.exe", "browser_download_url": "https://x/kebabify.exe"},
-                {"name": "notes.txt", "browser_download_url": "https://x/notes.txt"},
+                {"name": "kebabify.exe", "browser_download_url": "https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe"},
+                {"name": "kebabify.exe.sha256", "browser_download_url": "https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe.sha256"},
+                {"name": "notes.txt", "browser_download_url": "https://github.com/x/notes.txt"},
             ],
         });
         let r = find_release(&payload, "0.4.0").unwrap();
         assert_eq!(r.version, "0.5.0");
-        assert_eq!(r.download_url, "https://x/kebabify.exe");
+        assert_eq!(r.sha_url.as_deref(), Some("https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe.sha256"));
 
         assert!(find_release(&payload, "0.5.0").is_none());
         assert!(find_release(&payload, "0.9.0").is_none());
         let no_asset = serde_json::json!({"tag_name": "v0.6.0", "assets": []});
         assert!(find_release(&no_asset, "0.4.0").is_none());
         assert!(find_release(&serde_json::json!({}), "0.4.0").is_none());
+        // Poisoned payload: off-host asset URL rejected.
+        let evil = serde_json::json!({
+            "tag_name": "v0.9.9",
+            "assets": [{"name": "kebabify.exe", "browser_download_url": "https://evil.com/kebabify.exe"}],
+        });
+        assert!(find_release(&evil, "0.4.0").is_none());
+    }
+
+    #[test]
+    fn hosts_pinned() {
+        assert!(pinned_url(
+            "https://github.com/kebab1337420/kebabify/releases/download/v0.5.0/kebabify.exe"
+        )
+        .is_ok());
+        assert!(pinned_url("https://objects.githubusercontent.com/x/y").is_ok());
+        assert!(pinned_url("http://github.com/x").is_err());
+        assert!(pinned_url("https://evil.com/kebabify.exe").is_err());
+        assert!(pinned_url("not a url").is_err());
+    }
+
+    use crate::mock::{MockServer, Route};
+
+    /// Download + checksum against a mock: pass-through on match, hard fail
+    /// (and no leftover file) on tamper.
+    #[tokio::test]
+    async fn download_verified_and_tamper_rejected() {
+        let payload = vec![65u8; 2048];
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&payload))
+        };
+        let mock = MockServer::start(vec![
+            Route::new("/file", vec![(200, payload.clone())]),
+            Route::new(
+                "/sha",
+                vec![(200, format!("{}  kebabify.exe\n", expected).into_bytes())],
+            ),
+        ])
+        .await;
+        let client = reqwest::Client::new();
+        let dir = std::env::temp_dir().join(format!("kebabify_update_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let info = ReleaseInfo {
+            version: "9.9.9".to_string(),
+            download_url: format!("{}/file", mock.base_url),
+            sha_url: Some(format!("{}/sha", mock.base_url)),
+        };
+        let dest = dir.join("kebabify.exe.new");
+        download_release(&client, &info, &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+
+        // Tampered bytes under the same checksum: rejected, nothing left.
+        let mock2 = MockServer::start(vec![
+            Route::new("/file", vec![(200, vec![66u8; 2048])]),
+            Route::new(
+                "/sha",
+                vec![(200, format!("{}  kebabify.exe\n", expected).into_bytes())],
+            ),
+        ])
+        .await;
+        let info2 = ReleaseInfo {
+            version: "9.9.9".to_string(),
+            download_url: format!("{}/file", mock2.base_url),
+            sha_url: Some(format!("{}/sha", mock2.base_url)),
+        };
+        let dest2 = dir.join("kebabify2.exe.new");
+        assert!(download_release(&client, &info2, &dest2).await.is_err());
+        assert!(!dest2.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -45,6 +45,12 @@ static RESOLVE_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// it is cut. Bounds a stalled transfer; healthy streams chunk continuously.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Total budget for one track resolution (lucida chain + saavn chain).
+/// Uncapped, an unlucky track burns minutes (30 polls × timeouts, then the
+/// whole Saavn chain) while the player hangs: fail at 60s so it falls back
+/// to native audio instead.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Grace period for in-flight streams after shutdown before teardown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -337,17 +343,16 @@ async fn serve_file<W: tokio::io::AsyncWrite + Unpin>(
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-    let (status_line, content_range, start, end) = match range
-        .and_then(|r| parse_range_header(r, len))
-    {
-        Some((s, e)) => (
-            "HTTP/1.1 206 Partial Content",
-            Some(format!("bytes {}-{}/{}", s, e, len)),
-            s,
-            e,
-        ),
-        None => ("HTTP/1.1 200 OK", None, 0, len.saturating_sub(1)),
-    };
+    let (status_line, content_range, start, end) =
+        match range.and_then(|r| parse_range_header(r, len)) {
+            Some((s, e)) => (
+                "HTTP/1.1 206 Partial Content",
+                Some(format!("bytes {}-{}/{}", s, e, len)),
+                s,
+                e,
+            ),
+            None => ("HTTP/1.1 200 OK", None, 0, len.saturating_sub(1)),
+        };
     let body_len = end.saturating_sub(start) + 1;
     let mut header = format!(
         "{}\r\nContent-Type: audio/flac\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache{}",
@@ -531,7 +536,13 @@ async fn handle_client(
             }
         }
 
-        let track = current_track.lock().await.clone();
+        // The now-playing track ID is listening-habit data: only allowlisted
+        // Spotify callers see it. Unauthenticated callers (curl, widgets)
+        // still get status/source/version.
+        let track = match origin.as_deref() {
+            Some(o) if is_allowed_origin(o) => current_track.lock().await.clone(),
+            _ => None,
+        };
         // Built with serde_json rather than format!: track IDs are validated
         // alphanumerics today, but manual quoting would silently break on the
         // first value that ever needs escaping.
@@ -550,7 +561,7 @@ async fn handle_client(
         .to_string();
 
         let mut resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
             body.len()
         );
         if let Some(o) = origin {
@@ -574,7 +585,7 @@ async fn handle_client(
         }
         let body = cached_update_check(&client).await;
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
             body.len(),
             cors_header_line(origin.as_deref()),
             body
@@ -609,7 +620,7 @@ async fn handle_client(
             serde_json::json!({"status": "updating", "version": version}).to_string()
         };
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
             body.len(),
             cors_header_line(origin.as_deref()),
             body
@@ -648,7 +659,7 @@ async fn handle_client(
         shutting_down.store(true, Ordering::Release);
         let body = serde_json::json!({"status": "stopping"}).to_string();
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -731,73 +742,86 @@ async fn handle_client(
         // beats a 502. The resolve permit is scoped to this block:
         // handshakes, polls and the P2P download are bounded, bodies stream
         // after (Soulseek serves from its local cache file instead).
-        let (upstream, source): (Upstream, &'static str) = {
-            let _resolve_permit = RESOLVE_PERMITS
-                .acquire()
-                .await
-                .context("resolve pool shut down")?;
-            match crate::soulseek::open_file(&client, &tid).await {
-                Ok(f) => (
-                    Upstream::File {
-                        path: f.path,
-                        len: f.len,
-                    },
-                    "soulseek",
-                ),
-                Err(slsk_err) => {
-                    eprintln!(
-                        "[kebabify] Soulseek failed for track {}: {:#} — trying lucida",
-                        tid, slsk_err
-                    );
-                    match crate::lucida::open_stream(
-                        &client,
-                        &spotify_url,
-                        range_header.as_deref(),
-                        if_range_header.as_deref(),
-                    )
+        // The whole resolution is additionally capped: an unlucky track must
+        // fail into native playback, not hang the player for minutes.
+        let (upstream, source): (Upstream, &'static str) =
+            match tokio::time::timeout(RESOLVE_TIMEOUT, async {
+                let _resolve_permit = RESOLVE_PERMITS
+                    .acquire()
                     .await
-                    {
-                        Ok(s) => (
-                            Upstream::Http {
-                                resp: s.response,
-                                is_flac: true,
-                            },
-                            "lucida",
-                        ),
-                        Err(lucida_err) => {
-                            eprintln!(
-                                "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
-                                tid, lucida_err
-                            );
-                            match crate::saavn::open_stream(
-                                &client,
-                                &tid,
-                                range_header.as_deref(),
-                                if_range_header.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok(s) => (
-                                    Upstream::Http {
-                                        resp: s.response,
-                                        is_flac: false,
-                                    },
-                                    "saavn",
-                                ),
-                                Err(saavn_err) => {
-                                    return Err(anyhow!(
+                    .context("resolve pool shut down")?;
+                match crate::soulseek::open_file(&client, &tid).await {
+                    Ok(f) => Ok((
+                        Upstream::File {
+                            path: f.path,
+                            len: f.len,
+                        },
+                        "soulseek",
+                    )),
+                    Err(slsk_err) => {
+                        eprintln!(
+                            "[kebabify] Soulseek failed for track {}: {:#} — trying lucida",
+                            tid, slsk_err
+                        );
+                        match crate::lucida::open_stream(
+                            &client,
+                            &spotify_url,
+                            range_header.as_deref(),
+                            if_range_header.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(s) => Ok((
+                                Upstream::Http {
+                                    resp: s.response,
+                                    is_flac: true,
+                                },
+                                "lucida",
+                            )),
+                            Err(lucida_err) => {
+                                eprintln!(
+                                    "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
+                                    tid, lucida_err
+                                );
+                                match crate::saavn::open_stream(
+                                    &client,
+                                    &tid,
+                                    range_header.as_deref(),
+                                    if_range_header.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(s) => Ok((
+                                        Upstream::Http {
+                                            resp: s.response,
+                                            is_flac: false,
+                                        },
+                                        "saavn",
+                                    )),
+                                    Err(saavn_err) => Err(anyhow!(
                                         "soulseek: {:#}; lucida: {:#}; saavn: {:#}",
                                         slsk_err,
                                         lucida_err,
                                         saavn_err
-                                    ));
+                                    )),
                                 }
                             }
                         }
                     }
                 }
-            }
-        };
+            })
+            .await
+            {
+                Ok(Ok((upstream, source))) => (upstream, source),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "upstream resolution timed out after {}s",
+                        RESOLVE_TIMEOUT.as_secs()
+                    ));
+                }
+            };
+
         *current_source.lock().await = Some(source);
 
         match upstream {
@@ -847,7 +871,7 @@ async fn handle_client(
             status.canonical_reason().unwrap_or("OK")
         );
         let mut response_header = format!(
-            "{}\r\nContent-Type: {}\r\nConnection: close\r\nCache-Control: no-cache{}",
+            "{}\r\nContent-Type: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nCache-Control: no-cache{}",
             status_line,
             content_type,
             cors_header_line(origin.as_deref())
@@ -923,18 +947,40 @@ async fn handle_client(
         // JSON reason (bounded) + CORS: the extension diagnoses 502s via
         // fetch, which needs ACAO to read the body at all. A Cloudflare 403
         // from lucida means "run kebabify import-cookies" — say so.
+        // The full reason names the playing track: only callers that get an
+        // ACAO header see it, everyone else gets a coarse class.
         let reason: String = format!("{:#}", e).chars().take(240).collect();
         eprintln!("[kebabify] Stream for track {} failed: {}", tid, reason);
+        let public = cors_allow_origin(origin.as_deref()).is_some();
+        let reason_out = if public {
+            reason
+        } else {
+            error_class(&reason).to_string()
+        };
         write_stream_error(
             &mut write_half,
             response_started,
             origin.as_deref(),
-            &reason,
+            &reason_out,
         )
         .await?;
     }
 
     result
+}
+
+/// Coarse failure class for callers that must not see the full reason
+/// (track titles and upstream internals). Pure for tests.
+fn error_class(reason: &str) -> &'static str {
+    if reason.contains("403") || reason.contains("Cloudflare") {
+        "lucida-403"
+    } else if reason.contains("no good match") {
+        "saavn-no-match"
+    } else if reason.contains("timed out") {
+        "upstream-timeout"
+    } else {
+        "proxy-error"
+    }
 }
 
 async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
@@ -951,16 +997,16 @@ async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
         "Soulseek login missing — run `kebabify soulseek <user> <pass>` (chain falls through to lucida/saavn anyway)"
     } else if reason.contains("403") || reason.contains("Cloudflare") {
         "lucida.to is behind Cloudflare — run `kebabify import-cookies` for FLAC (Saavn fallback also failed)"
-    } else if reason.contains("no good match") {
+    } else if reason.contains("no good match") || reason.contains("saavn-no-match") {
         "Saavn fallback found no reliable 320kbps match — track may be missing or mislabeled there"
-    } else if reason.contains("timed out") {
+    } else if reason.contains("timed out") || reason.contains("upstream-timeout") {
         "upstreams took too long — retry, or check your connection"
     } else {
         "proxy stream error"
     };
     let body = stream_error_body(hint, reason);
     let resp = format!(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
         body.len(),
         cors_header_line(origin),
         body
@@ -1014,7 +1060,7 @@ async fn write_bad_request<W: tokio::io::AsyncWrite + Unpin>(
     use tokio::io::AsyncWriteExt;
     let body = serde_json::json!({"status": "error", "hint": hint}).to_string();
     let resp = format!(
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n{}",
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close{}\r\n\r\n{}",
         body.len(),
         cors_header_line(origin),
         body
@@ -1035,7 +1081,7 @@ async fn write_busy<W: tokio::io::AsyncWrite + Unpin>(
     let body = serde_json::json!({"status": "busy", "hint": "proxy at capacity — retry shortly"})
         .to_string();
     let resp = format!(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 2\r\nConnection: close{}\r\n\r\n{}",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nRetry-After: 2\r\nConnection: close{}\r\n\r\n{}",
         body.len(),
         cors_header_line(origin),
         body
@@ -1046,14 +1092,14 @@ async fn write_busy<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 /// Value for `Access-Control-Allow-Origin`, or `None` when the header must be
-/// omitted: an allowlisted Spotify caller is echoed back, a missing (or
-/// `null`) Origin gets `*` for curl/media elements, and anything else — e.g.
-/// a DNS-rebound `evil.com` — gets nothing, so a hostile page can neither
-/// read audio bytes nor error bodies fetched cross-origin.
+/// omitted: an allowlisted Spotify caller is echoed back, callers with no
+/// `Origin` (curl, media elements) get `*` so local debugging keeps working.
+/// Anything else — a DNS-rebound `evil.com` or a sandboxed `null` iframe that
+/// *can* read `*` responses — gets nothing, so hostile pages can neither read
+/// audio bytes nor error bodies fetched cross-origin.
 fn cors_allow_origin(origin: Option<&str>) -> Option<&str> {
     match origin {
         None => Some("*"),
-        Some("null") => Some("*"),
         Some(o) if is_allowed_origin(o) => Some(o),
         _ => None,
     }
@@ -1077,7 +1123,7 @@ async fn write_preflight<W: tokio::io::AsyncWrite + Unpin>(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let resp = format!(
-        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Range, Origin, Content-Type\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close{}\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\nX-Content-Type-Options: nosniff\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Range, Origin, Content-Type\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close{}\r\n\r\n",
         cors_header_line(origin)
     );
     write_half.write_all(resp.as_bytes()).await?;
@@ -1090,7 +1136,7 @@ async fn write_forbidden<W: tokio::io::AsyncWrite + Unpin>(write_half: &mut W) -
     use tokio::io::AsyncWriteExt;
     let body = serde_json::json!({"status": "forbidden"}).to_string();
     let resp = format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -1374,6 +1420,7 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(text.contains("Retry-After: 2\r\n"));
         assert!(text.contains("Access-Control-Allow-Origin: *\r\n"));
+        assert!(text.contains("X-Content-Type-Options: nosniff\r\n"));
     }
 
     #[test]
@@ -1526,7 +1573,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_security_headers_rejected() {        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
+    fn duplicate_security_headers_rejected() {
+        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
         assert!(!has_conflicting_headers(same_twice));
         let conflict = "GET / HTTP/1.1\r\nOrigin: https://evil.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
         assert!(has_conflicting_headers(conflict));
@@ -1540,7 +1588,10 @@ mod tests {
         const LEN: u64 = 25_278_482;
         assert_eq!(parse_range_header("bytes=0-15", LEN), Some((0, 15)));
         assert_eq!(parse_range_header("bytes=100-", LEN), Some((100, LEN - 1)));
-        assert_eq!(parse_range_header("bytes=-500", LEN), Some((LEN - 500, LEN - 1)));
+        assert_eq!(
+            parse_range_header("bytes=-500", LEN),
+            Some((LEN - 500, LEN - 1))
+        );
         // Malformed or unsatisfiable → None (caller serves 200 full body).
         assert_eq!(parse_range_header("bytes=99-10", LEN), None);
         assert_eq!(parse_range_header("bytes=99999999-", LEN), None);
