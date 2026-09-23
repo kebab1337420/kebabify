@@ -87,7 +87,8 @@ enum Commands {
         user: String,
         /// Soulseek password
         pass: String,
-    },    /// Apply patches, launch Spotify supervised, and stop the audio proxy
+    },
+    /// Apply patches, launch Spotify supervised, and stop the audio proxy
     /// when Spotify exits — the proxy lives exactly as long as Spotify.
     /// Use this (e.g. pinned instead of Spotify) so every Spotify start gets
     /// a proxy and no proxy lingers afterwards.
@@ -122,7 +123,9 @@ async fn print_runtime_state() {
     }
     match soulseek::binary_path() {
         Some(p) if p.is_file() => println!("Soulseek binary:       yes"),
-        _ => println!("Soulseek binary:       missing — put sockseek.exe in %APPDATA%\\Kebabify\\bin\\"),
+        _ => println!(
+            "Soulseek binary:       missing — put sockseek.exe in %APPDATA%\\Kebabify\\bin\\"
+        ),
     }
 }
 
@@ -240,7 +243,8 @@ async fn ensure_proxy() -> Result<()> {
 }
 
 /// Warns when FLAC cannot work for missing cookies (Saavn still does).
-fn warn_no_cookies() {    // Without stored Cloudflare cookies every track fails at the
+fn warn_no_cookies() {
+    // Without stored Cloudflare cookies every track fails at the
     // lucida handshake (HTTP 403 → proxy 502): warn now instead
     // of letting the user discover it track by track.
     if !lucida::has_cf_clearance() {
@@ -397,7 +401,9 @@ async fn cmd_import_cookies() -> Result<()> {
 /// never echoed back.
 async fn cmd_soulseek(user: String, pass: String) -> Result<()> {
     if user.trim().is_empty() || pass.is_empty() {
-        return Err(anyhow::anyhow!("Soulseek username and password must not be empty"));
+        return Err(anyhow::anyhow!(
+            "Soulseek username and password must not be empty"
+        ));
     }
     let path = soulseek::save_credentials(&user, &pass)?;
     println!("kebabify — Soulseek login stored ({}).", path.display());

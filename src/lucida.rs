@@ -288,11 +288,7 @@ impl Default for LucidaEndpoints {
 /// anything else is rejected instead of being interpolated. `name` is echoed
 /// raw like the site client does (the API matches on it verbatim). Pure for
 /// tests.
-fn poll_urls(
-    status_base: &str,
-    handoff: &str,
-    name: &str,
-) -> Result<(String, String)> {
+fn poll_urls(status_base: &str, handoff: &str, name: &str) -> Result<(String, String)> {
     let handoff_ok = !handoff.is_empty()
         && handoff
             .bytes()
@@ -818,7 +814,10 @@ mod tests {
             .containing("request"),
             Route::new(
                 "/api/load",
-                vec![(200, br#"{"success":true,"handoff":"h1","name":"n1"}"#.to_vec())],
+                vec![(
+                    200,
+                    br#"{"success":true,"handoff":"h1","name":"n1"}"#.to_vec(),
+                )],
             ),
             Route::catch_all(200, resolve_html()),
         ])
@@ -858,7 +857,10 @@ mod tests {
         let mock = MockServer::start(vec![
             Route::new(
                 "/api/load",
-                vec![(200, br#"{"success":true,"handoff":"h1","name":"n1"}"#.to_vec())],
+                vec![(
+                    200,
+                    br#"{"success":true,"handoff":"h1","name":"n1"}"#.to_vec(),
+                )],
             ),
             Route::catch_all(200, resolve_html()),
         ])

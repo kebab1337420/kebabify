@@ -343,17 +343,16 @@ async fn serve_file<W: tokio::io::AsyncWrite + Unpin>(
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-    let (status_line, content_range, start, end) = match range
-        .and_then(|r| parse_range_header(r, len))
-    {
-        Some((s, e)) => (
-            "HTTP/1.1 206 Partial Content",
-            Some(format!("bytes {}-{}/{}", s, e, len)),
-            s,
-            e,
-        ),
-        None => ("HTTP/1.1 200 OK", None, 0, len.saturating_sub(1)),
-    };
+    let (status_line, content_range, start, end) =
+        match range.and_then(|r| parse_range_header(r, len)) {
+            Some((s, e)) => (
+                "HTTP/1.1 206 Partial Content",
+                Some(format!("bytes {}-{}/{}", s, e, len)),
+                s,
+                e,
+            ),
+            None => ("HTTP/1.1 200 OK", None, 0, len.saturating_sub(1)),
+        };
     let body_len = end.saturating_sub(start) + 1;
     let mut header = format!(
         "{}\r\nContent-Type: audio/flac\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache{}",
@@ -1574,7 +1573,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_security_headers_rejected() {        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
+    fn duplicate_security_headers_rejected() {
+        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
         assert!(!has_conflicting_headers(same_twice));
         let conflict = "GET / HTTP/1.1\r\nOrigin: https://evil.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
         assert!(has_conflicting_headers(conflict));
@@ -1588,7 +1588,10 @@ mod tests {
         const LEN: u64 = 25_278_482;
         assert_eq!(parse_range_header("bytes=0-15", LEN), Some((0, 15)));
         assert_eq!(parse_range_header("bytes=100-", LEN), Some((100, LEN - 1)));
-        assert_eq!(parse_range_header("bytes=-500", LEN), Some((LEN - 500, LEN - 1)));
+        assert_eq!(
+            parse_range_header("bytes=-500", LEN),
+            Some((LEN - 500, LEN - 1))
+        );
         // Malformed or unsatisfiable → None (caller serves 200 full body).
         assert_eq!(parse_range_header("bytes=99-10", LEN), None);
         assert_eq!(parse_range_header("bytes=99999999-", LEN), None);
