@@ -16,7 +16,7 @@
 //!    `link.helper.ts`) → `_96` URL → swapped to `_320`.
 //! 6. GET the CDN URL (Range forwarded) → streamed by the proxy like lucida.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// Metadata identifying a Spotify track for the Saavn search.
 pub struct TrackMeta {
@@ -28,8 +28,14 @@ pub struct TrackMeta {
 
 /// A resolved, ready-to-download 320kbps stream from the Saavn CDN.
 pub struct SaavnStream {
-    /// The HTTP response for the audio download, ready to be streamed.
-    pub response: reqwest::Response,
+    response: reqwest::Response,
+}
+
+impl SaavnStream {
+    /// Consumes the stream into the underlying HTTP response for piping.
+    pub fn into_response(self) -> reqwest::Response {
+        self.response
+    }
 }
 
 /// Timeout for the single-shot metadata calls (embed, search, details).
@@ -49,42 +55,117 @@ const MAX_DURATION_GAP_S: u64 = 15;
 /// carry no visible expiry; 10 min TTL stays well clear of rotations.
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Track ID → (CDN URL, resolved-at). Positive hits only; misses surface so
-/// catalog changes are picked up on the next try instead of going stale.
-static CDN_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Unresolvable track IDs cached briefly so a dead catalog entry (or a dead
+/// CDN link) doesn't repay the full embed + search + details chain on every
+/// replay/prefetch. Short TTL: catalog changes are picked up within minutes.
+const NEG_TTL: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Capacity of each cache: bounded memory, eviction is true LRU below.
+const CACHE_CAP: usize = 512;
+
+/// Small true-LRU map (no dependency): `HashMap` for lookup plus a
+/// `VecDeque` recency order (MRU at the back). At 512 entries the linear
+/// touch-on-read is noise next to one HTTPS round-trip.
+struct LruCache {
+    map: std::collections::HashMap<String, (String, std::time::Instant)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl LruCache {
+    fn get(&mut self, key: &str, ttl: std::time::Duration) -> Option<String> {
+        let (url, at) = self.map.get(key)?;
+        if at.elapsed() >= ttl {
+            self.map.remove(key);
+            return None;
+        }
+        let url = url.clone();
+        // Touch: move to the MRU back.
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_string());
+        Some(url)
+    }
+
+    fn insert(&mut self, key: String, url: String) {
+        if let Some(pos) = self.order.iter().position(|k| k == &key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, (url, std::time::Instant::now()));
+        while self.map.len() > CACHE_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn sweep_expired(&mut self, ttl: std::time::Duration) {
+        self.map.retain(|_, (_, at)| at.elapsed() < ttl);
+        let live: std::collections::HashSet<&str> = self.map.keys().map(String::as_str).collect();
+        self.order.retain(|k| live.contains(k.as_str()));
+    }
+}
+
+/// Track ID → CDN URL (positive hits) with true-LRU eviction.
+static CDN_CACHE: std::sync::LazyLock<std::sync::Mutex<LruCache>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(LruCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    });
+
+/// Track ID → unresolvable marker (negative hits, short TTL).
+static NEG_CACHE: std::sync::LazyLock<std::sync::Mutex<LruCache>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(LruCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    });
 
 /// Cached CDN URL when fresh, else `None`. Stale entries are evicted on
 /// read so the map can't fill with dead weight over a long-running proxy.
 fn cached_cdn_url(track_id: &str) -> Option<String> {
-    let mut guard = CDN_CACHE.lock().ok()?;
-    let (url, at) = guard.get(track_id)?;
-    if !cache_is_fresh(*at) {
-        guard.remove(track_id);
-        return None;
-    }
-    Some(url.clone())
-}
-
-fn cache_is_fresh(at: std::time::Instant) -> bool {
-    at.elapsed() < CACHE_TTL
+    CDN_CACHE.lock().ok()?.get(track_id, CACHE_TTL)
 }
 
 fn store_cdn_url(track_id: &str, url: String) {
     if let Ok(mut guard) = CDN_CACHE.lock() {
-        // Sweep expired, then halve on overflow (never drop everything at
-        // once: that would thundering-herd the upstreams on re-resolve).
-        guard.retain(|_, (_, at)| cache_is_fresh(*at));
-        if guard.len() >= 512 {
-            let drop_n = guard.len() / 2;
-            let keys: Vec<String> = guard.keys().take(drop_n).cloned().collect();
-            for k in keys {
-                guard.remove(&k);
-            }
-        }
-        guard.insert(track_id.to_string(), (url, std::time::Instant::now()));
+        guard.sweep_expired(CACHE_TTL);
+        guard.insert(track_id.to_string(), url);
     }
+}
+
+/// Evicts one positive entry (rotated/dead CDN link): the next attempt
+/// re-resolves instead of failing on the poisoned URL for the full TTL.
+fn evict_cdn_url(track_id: &str) {
+    if let Ok(mut guard) = CDN_CACHE.lock() {
+        guard.map.remove(track_id);
+        guard.order.retain(|k| k != track_id);
+    }
+}
+
+/// Records a track as recently unresolvable (no match, or its CDN link
+/// died): the next attempt within [`NEG_TTL`] fails fast without hammering
+/// the upstreams.
+fn store_negative(track_id: &str) {
+    if let Ok(mut guard) = NEG_CACHE.lock() {
+        guard.sweep_expired(NEG_TTL);
+        guard.insert(track_id.to_string(), String::new());
+    }
+}
+
+/// `true` when the track failed recently (fail fast, see [`store_negative`]).
+fn is_negative(track_id: &str) -> bool {
+    NEG_CACHE
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.get(track_id, NEG_TTL))
+        .is_some()
 }
 
 /// Markers that disqualify a result unless the query has them too.
@@ -149,25 +230,41 @@ async fn open_stream_with(
     ep: &SaavnEndpoints,
 ) -> Result<SaavnStream> {
     if let Some(url) = cached_cdn_url(track_id) {
-        return stream_cdn(client, &url, range, if_range).await;
+        match stream_cdn(client, &url, range, if_range).await {
+            Ok(s) => return Ok(s),
+            Err(_) => {
+                // Rotated/dead link: evict so the next attempt re-resolves
+                // instead of failing on the same poisoned URL for 10 min.
+                evict_cdn_url(track_id);
+            }
+        }
+    }
+    // Recently unresolvable (no match, or its link died): fail fast without
+    // repaying the full embed + search + details chain on every replay.
+    if is_negative(track_id) {
+        return Err(anyhow!("Saavn: recently unresolvable (negative cache)"));
     }
     let meta = track_meta(client, track_id, &ep.embed_base).await?;
     let query = format!("{} {}", meta.title, meta.artist);
     let candidates = search_candidates(client, &query, &ep.api_base).await?;
-    let picked = candidates
+    let picked = match candidates
         .iter()
         .map(|c| (score_candidate(&meta, c), c))
         .filter(|(s, _)| *s >= ACCEPT_SCORE)
         .max_by_key(|(s, _)| *s)
         .map(|(_, c)| c)
-        .ok_or_else(|| {
-            anyhow!(
+    {
+        Some(c) => c,
+        None => {
+            store_negative(track_id);
+            return Err(anyhow!(
                 "Saavn: no good match for '{} – {}' ({} candidates)",
                 meta.title,
                 meta.artist,
                 candidates.len()
-            )
-        })?;
+            ));
+        }
+    };
 
     // Search hits already carry `encrypted_media_url` (byte-identical to the
     // details endpoint): decrypt straight away, keep `details` for hits
@@ -180,8 +277,18 @@ async fn open_stream_with(
         },
         None => details_media_url(client, &ep.api_base, &picked.token).await?,
     };
-    store_cdn_url(track_id, cdn_url.clone());
-    stream_cdn(client, &cdn_url, range, if_range).await
+    // Cache only what demonstrably streams: a rotated 403/404 link must not
+    // poison the positive cache for the full TTL.
+    match stream_cdn(client, &cdn_url, range, if_range).await {
+        Ok(s) => {
+            store_cdn_url(track_id, cdn_url);
+            Ok(s)
+        }
+        Err(e) => {
+            store_negative(track_id);
+            Err(e)
+        }
+    }
 }
 
 /// GETs a resolved CDN URL (Range/If-Range forwarded, body unbounded like
@@ -493,8 +600,8 @@ async fn details_media_url(
 /// Decrypts `encrypted_media_url` and upgrades the quality marker to 320.
 /// DES-ECB, key `38346591` (cf. sumitkolhe/jiosaavn-api `link.helper.ts`).
 fn decrypt_media_url(enc: &str) -> Result<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
     use des::Des;
 
     let mut data = STANDARD
@@ -505,9 +612,10 @@ fn decrypt_media_url(enc: &str) -> Result<String> {
     }
     let cipher =
         Des::new_from_slice(b"38346591").map_err(|e| anyhow!("Saavn: bad DES key: {}", e))?;
-    let (blocks, _) = data.as_chunks_mut::<8>();
-    for chunk in blocks {
-        cipher.decrypt_block(GenericArray::from_mut_slice(chunk));
+    // as_chunks_mut needs Rust 1.88+; chunks_mut + try_into keeps MSRV 1.85.
+    for chunk in data.chunks_mut(8) {
+        let block: &mut [u8; 8] = chunk.try_into().expect("Saavn: length is a multiple of 8");
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
     }
     // PKCS#7 unpad.
     let pad = *data.last().unwrap() as usize;
@@ -645,13 +753,13 @@ mod tests {
 
     #[test]
     fn cache_freshness() {
-        assert!(cache_is_fresh(std::time::Instant::now()));
+        assert!(std::time::Instant::now().elapsed() < CACHE_TTL);
         // Instant - Duration panics on underflow (fresh-boot machines), so a
         // stale instant is only asserted when representable.
         if let Some(stale) =
             std::time::Instant::now().checked_sub(CACHE_TTL + std::time::Duration::from_secs(1))
         {
-            assert!(!cache_is_fresh(stale));
+            assert!(stale.elapsed() >= CACHE_TTL);
         }
     }
 
@@ -677,6 +785,43 @@ mod tests {
         assert_eq!(m.title, "a</script><script>b");
     }
 
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let mut c = LruCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        };
+        for i in 0..CACHE_CAP {
+            c.insert(format!("t{}", i), format!("u{}", i));
+        }
+        // Touch t0 (now MRU), then overflow: t1 (LRU) goes, t0 survives.
+        assert_eq!(c.get("t0", CACHE_TTL).as_deref(), Some("u0"));
+        c.insert("new".to_string(), "unew".to_string());
+        assert_eq!(c.map.len(), CACHE_CAP);
+        assert!(c.get("t1", CACHE_TTL).is_none());
+        assert_eq!(c.get("t0", CACHE_TTL).as_deref(), Some("u0"));
+        assert_eq!(c.get("new", CACHE_TTL).as_deref(), Some("unew"));
+        // Expired entries read as misses and don't count as use.
+        c.map.insert(
+            "old".to_string(),
+            (
+                "uold".to_string(),
+                std::time::Instant::now() - CACHE_TTL * 2,
+            ),
+        );
+        assert!(c.get("old", CACHE_TTL).is_none());
+    }
+
+    #[test]
+    fn negative_cache_fails_fast_then_expires_by_ttl() {
+        let id = "neg-test-track-xyz";
+        assert!(!is_negative(id));
+        store_negative(id);
+        assert!(is_negative(id));
+        // A different id is unaffected (globals shared across tests).
+        assert!(!is_negative("neg-test-track-other"));
+    }
+
     use crate::mock::{MockServer, Route};
 
     const MOCK_SONG: &[u8] = b"mp4-audio-byTES-0123456789";
@@ -684,16 +829,17 @@ mod tests {
     /// DES-ECB encryption mirroring [`decrypt_media_url`], to mint a valid
     /// `encrypted_media_url` pointing back at the mock (fully offline).
     fn encrypt_media_url(plain: &str) -> String {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
         use des::Des;
         let mut data = plain.as_bytes().to_vec();
         let pad = 8 - (data.len() % 8);
         data.extend(std::iter::repeat_n(pad as u8, pad));
         let cipher = Des::new_from_slice(b"38346591").unwrap();
-        let (blocks, _) = data.as_chunks_mut::<8>();
-        for c in blocks {
-            cipher.encrypt_block(GenericArray::from_mut_slice(c));
+        // as_chunks_mut needs Rust 1.88+; chunks_mut + try_into keeps MSRV.
+        for chunk in data.chunks_mut(8) {
+            let block: &mut [u8; 8] = chunk.try_into().unwrap();
+            cipher.encrypt_block(GenericArray::from_mut_slice(block));
         }
         STANDARD.encode(&data)
     }
@@ -706,7 +852,9 @@ mod tests {
     /// details round-trip) → CDN stream, plain and ranged.
     #[tokio::test]
     async fn full_flow_resolves_and_streams_with_range() {
-        let port = MockServer::reserve_port().await;
+        // Eager bind: the encrypted fixture embeds the port, so the socket
+        // must stay bound from pick to serve (no reserve-then-rebind race).
+        let (listener, port) = MockServer::bind_ephemeral().await;
         let cdn_plain = format!("http://127.0.0.1:{}/cdn/song_96.mp4", port);
         let enc = encrypt_media_url(&cdn_plain);
         let search_json = serde_json::json!({
@@ -723,8 +871,8 @@ mod tests {
                 },
             }],
         });
-        let mock = MockServer::start_on(
-            port,
+        let mock = MockServer::serve(
+            listener,
             vec![
                 Route::new("/embed/track/", vec![(200, embed_html())]),
                 Route::new(
@@ -734,8 +882,7 @@ mod tests {
                 .containing("search.getResults"),
                 Route::new("/cdn/", vec![(200, MOCK_SONG.to_vec())]).ranged(),
             ],
-        )
-        .await;
+        );
         let ep = SaavnEndpoints {
             embed_base: mock.base_url.clone(),
             api_base: mock.base_url.clone(),
@@ -745,15 +892,17 @@ mod tests {
         let s = open_stream_with(&client, "mock-track-0001", None, None, &ep)
             .await
             .unwrap();
-        assert_eq!(s.response.status(), 200);
-        assert_eq!(s.response.bytes().await.unwrap().as_ref(), MOCK_SONG);
+        let r = s.into_response();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), MOCK_SONG);
 
         // Second call is served from the CDN cache (no re-resolve).
         let s = open_stream_with(&client, "mock-track-0001", Some("bytes=0-3"), None, &ep)
             .await
             .unwrap();
-        assert_eq!(s.response.status(), 206);
-        assert_eq!(s.response.bytes().await.unwrap().as_ref(), &MOCK_SONG[..4]);
+        let r = s.into_response();
+        assert_eq!(r.status(), 206);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), &MOCK_SONG[..4]);
     }
 
     /// `details` path with a live-captured vector: pointer parse + decrypt,
@@ -767,11 +916,10 @@ mod tests {
                 },
             }],
         });
-        let mock = MockServer::start(vec![Route::new(
-            "/api.php",
-            vec![(200, serde_json::to_vec(&json).unwrap())],
-        )
-        .containing("webapi.get")])
+        let mock = MockServer::start(vec![
+            Route::new("/api.php", vec![(200, serde_json::to_vec(&json).unwrap())])
+                .containing("webapi.get"),
+        ])
         .await;
         let client = reqwest::Client::new();
         let url = details_media_url(&client, &mock.base_url, "TOK")

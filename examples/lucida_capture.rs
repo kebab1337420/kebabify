@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -217,8 +217,26 @@ async fn main() -> Result<()> {
     let url = "https://lucida.to/https%3A%2F%2Fopen.spotify.com%2Ftrack%2F11dFghVXANMlKmJXsNCbNl";
     let browser = find_browser()?;
     println!("using browser: {}", browser.display());
+    // Same microsecond pick-then-bind race as the real importer: retry the
+    // whole launch with a fresh port instead of failing on a stolen one.
+    let mut last_err = String::new();
+    for _ in 0..3 {
+        match capture_once(&browser, url).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("{:#}", e);
+                eprintln!("launch attempt failed — retrying: {last_err}");
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "browser launch failed after retries: {last_err}"
+    ))
+}
+
+async fn capture_once(browser: &PathBuf, url: &str) -> Result<()> {
     let port = free_port()?;
-    let mut child = launch_browser(&browser, port, "about:blank")?;
+    let mut child = launch_browser(browser, port, "about:blank")?;
     let ws_url = wait_for_page(port).await?;
     println!("cdp: {ws_url}");
     let mut cdp = Cdp::connect(&ws_url).await?;
