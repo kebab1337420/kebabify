@@ -239,21 +239,6 @@ impl AudioProxy {
         }
         false
     }
-
-    /// Waits up to `timeout` for the proxy to stop answering (inverse of
-    /// readiness — used after requesting a shutdown before respawning, so a
-    /// draining old instance still holding the port doesn't make the new
-    /// spawn fail its bind).
-    pub async fn wait_until_stopped(timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            if !Self::is_running().await {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        false
-    }
 }
 
 /// Parsed `/health` state: liveness plus the serving binary's version.
