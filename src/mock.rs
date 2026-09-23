@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 pub struct Route {
     prefix: String,
     contains: Option<String>,
-    suffix: Option<String>,
     responses: VecDeque<(u16, Vec<u8>)>,
     ranged: bool,
 }
@@ -20,7 +19,6 @@ impl Route {
         Self {
             prefix: prefix.to_string(),
             contains: None,
-            suffix: None,
             responses: responses.into(),
             ranged: false,
         }
@@ -31,18 +29,10 @@ impl Route {
         self
     }
 
-    /// Only match paths ending with `suffix` (e.g. `/download` under a
-    /// `/status/` prefix).
-    pub fn ending_with(mut self, suffix: &str) -> Self {
-        self.suffix = Some(suffix.to_string());
-        self
-    }
-
     pub fn catch_all(status: u16, body: Vec<u8>) -> Self {
         Self {
             prefix: String::new(),
             contains: None,
-            suffix: None,
             responses: VecDeque::from(vec![(status, body)]),
             ranged: false,
         }
@@ -161,7 +151,6 @@ async fn serve_one(sock: tokio::net::TcpStream, routes: &Arc<Mutex<Vec<Route>>>)
         let hit = routes.iter_mut().find(|r| {
             path.starts_with(&r.prefix)
                 && r.contains.as_ref().is_none_or(|c| path.contains(c))
-                && r.suffix.as_ref().is_none_or(|s| path.ends_with(s))
         });
         match hit {
             Some(route) => {

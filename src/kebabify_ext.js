@@ -33,6 +33,11 @@
         if (window.__kebabifyDebug) console.log.apply(console, arguments);
     }
 
+    // Last upstream that served a track ('soulseek' | 'lucida' | 'saavn'),
+    // from /health. Only trusted while a track is attached to it.
+    var lastSource = 'spotify';
+    var tickProxified = false;
+    var tickPlaying = false;
     // Module-level guards so observers/wrappers are installed only once.
     var fetchPatched = false;
     var xhrPatched = false;
@@ -64,7 +69,11 @@
                 var healthy = alive;
                 resp.json().then(function(data) {
                     if (alive && data && data.flac) healthy = true;
+                    if (data && data.track && typeof data.source === 'string' && data.source !== 'none') {
+                        lastSource = data.source;
+                    }
                     applyProxyHealth(healthy);
+                    refreshSourceBadge();
                 }).catch(function() {
                     applyProxyHealth(alive);
                 });
@@ -295,12 +304,97 @@
     // Reads the current track ID from the now-playing widget of the Spotify UI.
     // Works without Spicetify: the widget contains a link like
     // spotify:track:11dF... (the audio element's URL only holds a file UUID).
-    function readNowPlayingTrackId() {
-        var el = document.querySelector('[data-testid="now-playing-widget"] a[href*="spotify:track:"], a[href^="spotify:track:"]');
-        if (!el) return null;
-        var href = el.getAttribute('href') || el.href || '';
+    // NOTE: this build of Spotify renders (almost) no data-testid attributes,
+    // so the DOM strategies below never rely on a single selector.
+    // Last track-link element found near the bottom of the viewport, reused as
+    // the insertion anchor for the source badge (bottom-left, version-proof).
+    var nowPlayingAnchorEl = null;
+
+    function normalizeTrackId(s) {
+        if (typeof s !== 'string' || !s) return null;
+        if (s.indexOf('spotify:track:') === 0) s = s.substring('spotify:track:'.length);
+        return isValidSpotifyTrackId(s) ? s : null;
+    }
+
+    function trackIdFromHref(href) {
+        if (typeof href !== 'string' || !href) return null;
         var m = href.match(/spotify:track:([A-Za-z0-9]{22})/);
-        return m ? m[1] : null;
+        if (m && isValidSpotifyTrackId(m[1])) return m[1];
+        m = href.match(/\/track\/([A-Za-z0-9]{22})(?:[?#/]|$)/);
+        if (m && isValidSpotifyTrackId(m[1])) return m[1];
+        return null;
+    }
+
+    function scanTrackLinks() {
+        var out = [];
+        var links;
+        try {
+            links = document.querySelectorAll('a[href*="/track/"], a[href^="spotify:track:"]');
+        } catch(e) { return out; }
+        for (var i = 0; i < links.length; i++) {
+            var id = trackIdFromHref(links[i].getAttribute('href') || links[i].href || '');
+            if (id) out.push({ id: id, el: links[i] });
+        }
+        return out;
+    }
+
+    function pickBottomLink(cands) {
+        if (!cands.length) return null;
+        var best = null, bestTop = -1;
+        for (var i = 0; i < cands.length; i++) {
+            var top = -1;
+            try {
+                var r = cands[i].el.getBoundingClientRect();
+                top = r.top;
+            } catch(e) {}
+            // Bottom bar (now-playing) links sit in the lower viewport;
+            // anything already in view still beats nothing.
+            if (top >= 0 && top > bestTop) { bestTop = top; best = cands[i]; }
+            if (!best) best = cands[i];
+        }
+        return best;
+    }
+
+    function readNowPlayingTrackId() {
+        // 1. Spicetify exposes the exact track, no DOM guessing.
+        try {
+            if (typeof window.Spicetify !== 'undefined' && window.Spicetify.Player && window.Spicetify.Player.trackID) {
+                var sid = normalizeTrackId(window.Spicetify.Player.trackID);
+                if (sid) return sid;
+            }
+        } catch(e) {}
+        // 2. Historical widget selector (kept: harmless if absent).
+        var el = document.querySelector('[data-testid="now-playing-widget"] a[href*="spotify:track:"], a[href^="spotify:track:"]');
+        if (el) {
+            var id = trackIdFromHref(el.getAttribute('href') || el.href || '');
+            if (id) { nowPlayingAnchorEl = el; return id; }
+        }
+        // 3. Geometric scan: track links nearest the bottom of the viewport
+        // are the now-playing ones (this build hashes all CSS classes and
+        // renders ~zero data-testid attributes).
+        var pick = pickBottomLink(scanTrackLinks());
+        if (pick) { nowPlayingAnchorEl = pick.el; return pick.id; }
+        // 4. Track page URL as a last resort.
+        try {
+            var lid = trackIdFromHref(location.href || '');
+            if (lid) return lid;
+        } catch(e2) {}
+        return null;
+    }
+
+    function findNowPlayingAnchor() {
+        var widget = document.querySelector('[data-testid="now-playing-widget"]');
+        if (widget) return { parent: widget, before: null };
+        if (nowPlayingAnchorEl && nowPlayingAnchorEl.isConnected && nowPlayingAnchorEl.parentNode) {
+            return { parent: nowPlayingAnchorEl.parentNode, before: nowPlayingAnchorEl.nextSibling };
+        }
+        // Refresh the geometric anchor on demand (widget may render late).
+        var pick = pickBottomLink(scanTrackLinks());
+        if (pick && pick.el.parentNode) {
+            nowPlayingAnchorEl = pick.el;
+            return { parent: pick.el.parentNode, before: pick.el.nextSibling };
+        }
+        return null;
     }
 
     // Extract a *valid* Spotify track ID from a URL.
@@ -571,6 +665,81 @@
         el.title = title;
     }
 
+    // ===== Source badge (Soulseek / Lucida / Saavn / Spotify) =====
+    // Second badge, placed in the now-playing widget (bottom-left of the
+    // playbar, next to the track info). Shows which upstream served the
+    // current file, as reported by /health. Read-only pill, no click.
+    function sourceLabel(src) {
+        if (src === 'soulseek') return 'Soulseek';
+        if (src === 'lucida') return 'Lucida';
+        if (src === 'saavn') return 'Saavn';
+        if (src === 'proxy') return 'Proxy';
+        return 'Spotify';
+    }
+
+    function injectSourceBadge() {
+        var badge = document.getElementById('kebabify-source');
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.id = 'kebabify-source';
+            badge.setAttribute('data-kebabify-source', 'spotify');
+            badge.title = 'Source du fichier en cours';
+            badge.textContent = 'Spotify';
+        }
+        var placed = false;
+        var widget = document.querySelector('[data-testid="now-playing-widget"]');
+        if (widget) {
+            widget.appendChild(badge);
+            placed = true;
+        } else {
+            // Version-proof bottom-left anchor: insert right after the
+            // now-playing track link instead of falling back to the top.
+            var anchor = findNowPlayingAnchor();
+            if (anchor && anchor.parent) {
+                anchor.parent.insertBefore(badge, anchor.before || null);
+                placed = true;
+            } else {
+                var kb = document.getElementById('kebabify-badge');
+                if (kb && kb.parentNode) {
+                    kb.parentNode.insertBefore(badge, kb.nextSibling);
+                    placed = true;
+                }
+            }
+        }
+        // Never a top bar: with no bottom-left anchor, park the badge
+        // invisibly instead of dumping it in <body>.
+        if (placed) {
+            badge.style.removeProperty('display');
+        } else {
+            badge.style.setProperty('display', 'none', 'important');
+            if (!badge.parentNode && document.body) document.body.appendChild(badge);
+        }
+        return badge;
+    }
+
+    function refreshSourceBadge() {
+        var badge = document.getElementById('kebabify-source') || injectSourceBadge();
+        if (!badge) return;
+        var src;
+        if (!flacPriority) {
+            src = 'spotify';
+        } else if (tickProxified) {
+            src = (lastSource && lastSource !== 'none' && lastSource !== 'spotify') ? lastSource : 'proxy';
+        } else if (tickPlaying) {
+            src = 'spotify';
+        } else {
+            return; // idle: keep the last label, don't churn
+        }
+        var label = sourceLabel(src);
+        // Skip the DOM write when nothing changed.
+        if (badge._kebabifySrc !== src) {
+            badge._kebabifySrc = src;
+            badge.setAttribute('data-kebabify-source', src);
+            badge.textContent = label;
+            badge.title = 'Source du fichier en cours : ' + label;
+        }
+    }
+
     function refreshBadge() {
         removeLegacyBadge();
         // Update playbar button
@@ -597,6 +766,7 @@
             badge.setAttribute('data-kebabify-proxy', proxyAlive ? 'true' : 'false');
             updateBadgeContent(badge);
         }
+        refreshSourceBadge();
         updateVerifiedIndicator();
     }
 
@@ -691,6 +861,9 @@
                     updateVerifiedIndicator();
                 }
                 if (!anyPlaying) lastTrackId = null;
+                tickProxified = proxifiedPlaying;
+                tickPlaying = anyPlaying;
+                refreshSourceBadge();
             } catch(e) {}
         }, 1000);
     }
@@ -758,11 +931,13 @@
                     injectFallbackBadge();
                 }
             }
+            if (!document.getElementById('kebabify-source')) injectSourceBadge();
         }, 2000);
 
         patchAudioUrls();
         interceptAudioElements();
         blockAds();
+        injectSourceBadge();
         monitorPlayback();
 
         // Start proxy health check every 3 seconds

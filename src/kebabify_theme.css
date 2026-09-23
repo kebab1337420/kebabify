@@ -254,3 +254,57 @@
     background: rgba(30, 215, 96, 0.25) !important;
     cursor: default !important;
 }
+
+/* =====================================================
+   kebabify source badge — second pill, appended inside the
+   now-playing widget (bottom-left of the playbar, next to
+   the track info). Read-only: shows which upstream served
+   the current file. Backgroundless like the KB badge,
+   color-coded per source.
+   ===================================================== */
+#kebabify-source {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    vertical-align: middle !important;
+    flex-shrink: 0 !important;
+    height: 18px !important;
+    line-height: 18px !important;
+    padding: 0 8px !important;
+    margin-left: 8px !important;
+    border-radius: 9px !important;
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+    background: transparent !important;
+    color: #7a7a7a !important;
+    font-family: 'Spotify Circular', Arial, sans-serif !important;
+    font-size: 10px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.4px !important;
+    text-transform: uppercase !important;
+    user-select: none !important;
+    pointer-events: none !important;
+}
+
+#kebabify-source[data-kebabify-source="soulseek"] {
+    color: #539df5 !important;
+    border-color: rgba(83, 157, 245, 0.4) !important;
+}
+
+#kebabify-source[data-kebabify-source="lucida"] {
+    color: #e91429 !important;
+    border-color: rgba(233, 20, 41, 0.45) !important;
+}
+
+#kebabify-source[data-kebabify-source="saavn"] {
+    color: #ffa42b !important;
+    border-color: rgba(255, 164, 43, 0.4) !important;
+}
+
+#kebabify-source[data-kebabify-source="spotify"] {
+    color: #1ED760 !important;
+    border-color: rgba(30, 215, 96, 0.4) !important;
+}
+
+#kebabify-source[data-kebabify-source="proxy"] {
+    color: #b3b3b3 !important;
+}

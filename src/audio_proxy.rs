@@ -4,8 +4,9 @@
 //! request (to audio-spclient.wg.spotify.com), the JS layer redirects it to
 //! this proxy. The proxy then:
 //! 1. Extracts the track ID from the original Spotify URL
-//! 2. Requests the FLAC version from lucida.to via [`crate::lucida`]
-//! 3. Streams the FLAC data back to Spotify's player
+//! 2. Resolves FLAC via the source chain: Soulseek P2P → lucida.to → Saavn
+//! 3. Streams the audio back to Spotify's player (relayed HTTP, or sliced
+//!    from the local Soulseek cache with Range support)
 
 use anyhow::{anyhow, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +62,8 @@ pub struct AudioProxy {
     port: u16,
     /// Currently playing track ID (for the /health endpoint).
     current_track: Arc<Mutex<Option<String>>>,
-    /// Which upstream serves it: "lucida" (FLAC) or "saavn" (320kbps).
+    /// Which upstream serves it: "soulseek" (FLAC, P2P), "lucida" (FLAC)
+    /// or "saavn" (320kbps).
     current_source: Arc<Mutex<Option<&'static str>>>,
     /// Signals the accept loop to terminate (graceful shutdown).
     shutdown: Arc<Notify>,
@@ -324,6 +326,106 @@ async fn cached_update_check(client: &reqwest::Client) -> String {
     body
 }
 
+/// What a source handed back: either a live HTTP response to relay
+/// (lucida/saavn), or a validated local file to slice (Soulseek downloads
+/// whole files — seeking is served from disk, not forwarded upstream).
+enum Upstream {
+    Http {
+        resp: reqwest::Response,
+        is_flac: bool,
+    },
+    File {
+        path: std::path::PathBuf,
+        len: u64,
+    },
+}
+
+/// Serves a cached local file (Soulseek source) with manual Range support.
+/// `headers_only` (HEAD) sends headers without the body, like the HTTP path.
+async fn serve_file<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    path: &std::path::Path,
+    len: u64,
+    range: Option<&str>,
+    origin: Option<&str>,
+    headers_only: bool,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let (status_line, content_range, start, end) = match range
+        .and_then(|r| parse_range_header(r, len))
+    {
+        Some((s, e)) => (
+            "HTTP/1.1 206 Partial Content",
+            Some(format!("bytes {}-{}/{}", s, e, len)),
+            s,
+            e,
+        ),
+        None => ("HTTP/1.1 200 OK", None, 0, len.saturating_sub(1)),
+    };
+    let body_len = end.saturating_sub(start) + 1;
+    let mut header = format!(
+        "{}\r\nContent-Type: audio/flac\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache{}",
+        status_line,
+        body_len,
+        cors_header_line(origin)
+    );
+    if let Some(cr) = content_range {
+        header.push_str(&format!("\r\nContent-Range: {}", cr));
+    }
+    header.push_str("\r\n\r\n");
+    writer.write_all(header.as_bytes()).await?;
+    writer.flush().await?;
+
+    if !headers_only {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .context("Failed to open cached FLAC")?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .context("Failed to seek cached FLAC")?;
+        let mut limited = file.take(body_len);
+        tokio::io::copy(&mut limited, writer)
+            .await
+            .context("Failed to send cached FLAC")?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+/// Parses a `Range` header against a known length. Returns the inclusive
+/// (start, end) byte span, or `None` when the range is missing, malformed
+/// or unsatisfiable (caller then serves 200 full body). Pure for tests.
+fn parse_range_header(range: &str, len: u64) -> Option<(u64, u64)> {
+    if len == 0 {
+        return None;
+    }
+    let spec = range.strip_prefix("bytes=")?;
+    let (start_str, end_str) = spec.split_once('-')?;
+    if start_str.is_empty() {
+        // Suffix range: last N bytes.
+        let n: u64 = end_str.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some((len.saturating_sub(n), len - 1))
+    } else {
+        let start: u64 = start_str.parse().ok()?;
+        if start >= len {
+            return None;
+        }
+        if end_str.is_empty() {
+            Some((start, len - 1))
+        } else {
+            let end: u64 = end_str.parse().ok()?;
+            if end < start || end >= len {
+                return None;
+            }
+            Some((start, end))
+        }
+    }
+}
+
 /// Handles a single HTTP request to the proxy.
 ///
 /// Lock order (never inverted anywhere): `current_track`, then
@@ -449,10 +551,12 @@ async fn handle_client(
         // alphanumerics today, but manual quoting would silently break on the
         // first value that ever needs escaping.
         let source = (*current_source.lock().await).unwrap_or("none");
+        // Soulseek serves validated FLAC too — the badge must not lie.
+        let flac = source == "lucida" || source == "soulseek";
         let body = serde_json::json!({
             "status": "ok",
             "track": track,
-            "flac": source == "lucida",
+            "flac": flac,
             "source": source,
             // Lets apply/run detect a stale detached proxy from an older
             // release and restart it instead of reusing it forever.
@@ -636,43 +740,74 @@ async fn handle_client(
     // reset afterwards so /health never reports a ghost track.
     let mut response_started = false;
     let result: Result<()> = async {
-        // Primary: lucida FLAC. Fallback: Saavn 320kbps — a track playing in
-        // high quality beats a 502. The resolve permit is scoped to this
-        // block: handshakes and polls are bounded, the body streams after.
-        let (mut audio_resp, is_flac, source): (reqwest::Response, bool, &'static str) = {
+        // Source chain, in priority order:
+        // 1. Soulseek P2P FLAC — no central server to take down, so first.
+        // 2. lucida FLAC. 3. Saavn 320kbps — a track playing in high quality
+        // beats a 502. The resolve permit is scoped to this block:
+        // handshakes, polls and the P2P download are bounded, bodies stream
+        // after (Soulseek serves from its local cache file instead).
+        let (upstream, source): (Upstream, &'static str) = {
             let _resolve_permit = RESOLVE_PERMITS
                 .acquire()
                 .await
                 .context("resolve pool shut down")?;
-            match crate::lucida::open_stream(
-                &client,
-                &spotify_url,
-                range_header.as_deref(),
-                if_range_header.as_deref(),
-            )
-            .await
-            {
-                Ok(s) => (s.response, true, "lucida"),
-                Err(lucida_err) => {
+            match crate::soulseek::open_file(&client, &tid).await {
+                Ok(f) => (
+                    Upstream::File {
+                        path: f.path,
+                        len: f.len,
+                    },
+                    "soulseek",
+                ),
+                Err(slsk_err) => {
                     eprintln!(
-                        "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
-                        tid, lucida_err
+                        "[kebabify] Soulseek failed for track {}: {:#} — trying lucida",
+                        tid, slsk_err
                     );
-                    match crate::saavn::open_stream(
+                    match crate::lucida::open_stream(
                         &client,
-                        &tid,
+                        &spotify_url,
                         range_header.as_deref(),
                         if_range_header.as_deref(),
                     )
                     .await
                     {
-                        Ok(s) => (s.response, false, "saavn"),
-                        Err(saavn_err) => {
-                            return Err(anyhow!(
-                                "lucida: {:#}; saavn: {:#}",
-                                lucida_err,
-                                saavn_err
-                            ));
+                        Ok(s) => (
+                            Upstream::Http {
+                                resp: s.response,
+                                is_flac: true,
+                            },
+                            "lucida",
+                        ),
+                        Err(lucida_err) => {
+                            eprintln!(
+                                "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
+                                tid, lucida_err
+                            );
+                            match crate::saavn::open_stream(
+                                &client,
+                                &tid,
+                                range_header.as_deref(),
+                                if_range_header.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(s) => (
+                                    Upstream::Http {
+                                        resp: s.response,
+                                        is_flac: false,
+                                    },
+                                    "saavn",
+                                ),
+                                Err(saavn_err) => {
+                                    return Err(anyhow!(
+                                        "soulseek: {:#}; lucida: {:#}; saavn: {:#}",
+                                        slsk_err,
+                                        lucida_err,
+                                        saavn_err
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -680,6 +815,23 @@ async fn handle_client(
         };
         *current_source.lock().await = Some(source);
 
+        match upstream {
+            Upstream::File { path, len } => {
+                serve_file(
+                    &mut write_half,
+                    &path,
+                    len,
+                    range_header.as_deref(),
+                    origin.as_deref(),
+                    method == "HEAD",
+                )
+                .await?;
+                eprintln!(
+                    "[kebabify] Served FLAC (soulseek P2P) for track {} ({} bytes)",
+                    tid, len
+                );
+            }
+            Upstream::Http { resp: mut audio_resp, is_flac } => {
         let default_type = if is_flac { "audio/flac" } else { "audio/mp4" };
         let content_type = audio_resp
             .headers()
@@ -764,6 +916,8 @@ async fn handle_client(
                 total_bytes
             );
         }
+            } // end Upstream::Http arm
+        } // end match upstream
 
         Ok(())
     }
@@ -808,7 +962,9 @@ async fn write_stream_error<W: tokio::io::AsyncWrite + Unpin>(
     if response_started {
         return Ok(());
     }
-    let hint = if reason.contains("403") || reason.contains("Cloudflare") {
+    let hint = if reason.contains("no credentials") {
+        "Soulseek login missing — run `kebabify soulseek <user> <pass>` (chain falls through to lucida/saavn anyway)"
+    } else if reason.contains("403") || reason.contains("Cloudflare") {
         "lucida.to is behind Cloudflare — run `kebabify import-cookies` for FLAC (Saavn fallback also failed)"
     } else if reason.contains("no good match") {
         "Saavn fallback found no reliable 320kbps match — track may be missing or mislabeled there"
@@ -1385,13 +1541,28 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_security_headers_rejected() {
-        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
+    fn duplicate_security_headers_rejected() {        let same_twice = "GET / HTTP/1.1\r\nOrigin: https://open.spotify.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
         assert!(!has_conflicting_headers(same_twice));
         let conflict = "GET / HTTP/1.1\r\nOrigin: https://evil.com\r\nOrigin: https://open.spotify.com\r\n\r\n";
         assert!(has_conflicting_headers(conflict));
         let ranges = "GET / HTTP/1.1\r\nRange: bytes=0-1\r\nRange: bytes=2-3\r\n\r\n";
         assert!(has_conflicting_headers(ranges));
         assert!(!has_conflicting_headers("GET / HTTP/1.1\r\n\r\n"));
+    }
+
+    #[test]
+    fn range_header_slices_local_files() {
+        const LEN: u64 = 25_278_482;
+        assert_eq!(parse_range_header("bytes=0-15", LEN), Some((0, 15)));
+        assert_eq!(parse_range_header("bytes=100-", LEN), Some((100, LEN - 1)));
+        assert_eq!(parse_range_header("bytes=-500", LEN), Some((LEN - 500, LEN - 1)));
+        // Malformed or unsatisfiable → None (caller serves 200 full body).
+        assert_eq!(parse_range_header("bytes=99-10", LEN), None);
+        assert_eq!(parse_range_header("bytes=99999999-", LEN), None);
+        assert_eq!(parse_range_header("bytes=0-99999999", LEN), None);
+        assert_eq!(parse_range_header("bytes=-0", LEN), None);
+        assert_eq!(parse_range_header("items=0-10", LEN), None);
+        assert_eq!(parse_range_header("bytes=abc-", LEN), None);
+        assert_eq!(parse_range_header("bytes=0-15", 0), None);
     }
 }

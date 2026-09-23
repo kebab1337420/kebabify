@@ -203,7 +203,9 @@ async fn stream_cdn(
 }
 
 /// Fetches title/artist/duration from the public Spotify embed page.
-async fn track_meta(
+/// `pub(crate)`: shared with the Soulseek source so both resolve paths use
+/// the same parser (one parser, no drift).
+pub(crate) async fn track_meta(
     client: &reqwest::Client,
     track_id: &str,
     embed_base: &str,

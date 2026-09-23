@@ -1,9 +1,9 @@
 [package]
 name = "kebabify"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["kebab1337420"]
-description = "Spicetify-like extension for Spotify: ad-free, lossless audio via lucida.to API with JioSaavn fallback"
+description = "Spicetify-like extension for Spotify: ad-free, lossless audio via Soulseek P2P with lucida.to and JioSaavn fallback"
 license = "MIT"
 repository = "https://github.com/kebab1337420/kebabify"
 readme = "README.md"
@@ -11,7 +11,7 @@ exclude = ["icons/*"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "io-util", "macros", "process"] }
 
 # HTTP client for the audio proxy
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

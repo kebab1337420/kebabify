@@ -258,12 +258,14 @@ pub struct LucidaStream {
 /// local mock. Injectable bases also leave the door open to mirrors.
 #[derive(Clone, Debug)]
 pub struct LucidaEndpoints {
-    /// Resolve host, e.g. `https://lucida.to`.
+    /// Resolve + load host, e.g. `https://lucida.to`.
     pub base: String,
     /// Full stream-request URL.
     pub api_load: String,
-    /// Status URL template with `{server}` and `{handoff}` placeholders.
-    pub status_tpl: String,
+    /// Host for the poll/download `/api/load` route (== `base` in
+    /// production; a separate field so tests can point status at a dead
+    /// port while resolve/load hit the mock).
+    pub status_base: String,
 }
 
 impl Default for LucidaEndpoints {
@@ -271,23 +273,26 @@ impl Default for LucidaEndpoints {
         Self {
             base: LUCIDA_BASE.to_string(),
             api_load: LUCIDA_API_LOAD.to_string(),
-            status_tpl: "https://{server}.lucida.to/api/fetch/request/{handoff}".to_string(),
+            status_base: LUCIDA_BASE.to_string(),
         }
     }
 }
 
-/// Builds the status + download URLs from the API's `server`/`handoff`.
-/// Both come from the network, so both are validated: `server` becomes a DNS
-/// label and `handoff` a path segment — anything else is rejected instead of
-/// being interpolated into a request URL. Pure for tests.
-fn status_urls(tpl: &str, server: &str, handoff: &str) -> Result<(String, String)> {
-    let server_ok = !server.is_empty()
-        && server
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    if !server_ok {
-        return Err(anyhow!("lucida API returned a bad server name"));
-    }
+/// Builds the poll + download URLs for a `handoff`/`name` pair.
+///
+/// The lucida client polls through the same `/api/load` route (no more
+/// `{server}.lucida.to` subdomain):
+/// `GET /api/load?url=<enc(/api/fetch/request/<handoff>)>&force=<name>`
+/// and downloads from the sibling `…/download` path with `&redirect=true`.
+/// `handoff` comes from the network so it is validated as a path segment —
+/// anything else is rejected instead of being interpolated. `name` is echoed
+/// raw like the site client does (the API matches on it verbatim). Pure for
+/// tests.
+fn poll_urls(
+    status_base: &str,
+    handoff: &str,
+    name: &str,
+) -> Result<(String, String)> {
     let handoff_ok = !handoff.is_empty()
         && handoff
             .bytes()
@@ -295,11 +300,25 @@ fn status_urls(tpl: &str, server: &str, handoff: &str) -> Result<(String, String
     if !handoff_ok {
         return Err(anyhow!("lucida API returned a bad handoff ID"));
     }
-    let status_url = tpl
-        .replace("{server}", server)
-        .replace("{handoff}", handoff);
-    let download_url = format!("{}/download", status_url);
-    Ok((status_url, download_url))
+    if name.is_empty() {
+        return Err(anyhow!("lucida API returned no request name"));
+    }
+    let poll_inner = format!("/api/fetch/request/{}", handoff);
+    let download_inner = format!("{}/download", poll_inner);
+    let base = status_base.trim_end_matches('/');
+    let poll_url = format!(
+        "{}/api/load?url={}&force={}",
+        base,
+        urlencoding::encode(&poll_inner),
+        name
+    );
+    let download_url = format!(
+        "{}/api/load?url={}&force={}&redirect=true",
+        base,
+        urlencoding::encode(&download_inner),
+        name
+    );
+    Ok((poll_url, download_url))
 }
 
 /// Resolves a Spotify track URL through lucida.to and returns a streaming
@@ -340,8 +359,10 @@ async fn open_stream_with(
     // user can rotate cookies and re-open a stream without restarting.
     let session = load_session();
 
-    // Step 1: resolve the track page to obtain the CSRF token.
-    let resolve_url = format!("{}/{}", ep.base, urlencoding::encode(spotify_url));
+    // Step 1: resolve the track through the page resolver (`/?url=`).
+    // A resolvable track yields SvelteKit page-data carrying
+    // `token:"…",tokenExpiry:<ms>`; an unavailable one yields `token:null`.
+    let resolve_url = format!("{}?url={}", ep.base, urlencoding::encode(spotify_url));
     let resolve_resp = identify(client.get(&resolve_url), session.as_ref())
         .timeout(REQUEST_TIMEOUT)
         .send()
@@ -360,10 +381,17 @@ async fn open_stream_with(
         .await
         .context("Failed to read lucida response")?;
 
-    let token = extract_csrf_token(&html).ok_or_else(|| {
-        anyhow!("Could not extract CSRF token from lucida page — page structure may have changed")
+    let (page_token, token_expiry) = extract_page_token(&html).ok_or_else(|| {
+        anyhow!("Could not parse lucida page-data — page structure may have changed")
     })?;
-    let token_expiry = extract_token_expiry(&html).unwrap_or(0u64);
+    let page_token = page_token.ok_or_else(|| {
+        anyhow!("lucida has no stream for this track (page token is null — not on its providers)")
+    })?;
+    // The site client sends `atob(atob(token))`: the page token is
+    // base64-of-base64.
+    let primary = double_b64_decode(&page_token).ok_or_else(|| {
+        anyhow!("Could not decode the lucida page token (expected base64-of-base64)")
+    })?;
 
     // Step 2: request the stream from the lucida API.
     let download_req = serde_json::json!({
@@ -375,7 +403,7 @@ async fn open_stream_with(
         "private": false,
         "token": {
             "expiry": token_expiry,
-            "primary": token,
+            "primary": primary,
             "secondary": null,
         },
         "upload": { "enabled": false },
@@ -402,8 +430,19 @@ async fn open_stream_with(
         .context("Failed to parse lucida API response")?;
 
     let handoff = dl.get("handoff").and_then(|v| v.as_str()).unwrap_or("");
-    let server = dl.get("server").and_then(|v| v.as_str()).unwrap_or("api");
-    let (status_url, download_url) = status_urls(&ep.status_tpl, server, handoff)?;
+    let name = dl.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if dl.get("success").and_then(|v| v.as_bool()) != Some(true)
+        || handoff.is_empty()
+        || name.is_empty()
+    {
+        let msg = dl
+            .get("message")
+            .or_else(|| dl.get("error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("no handoff");
+        return Err(anyhow!("lucida refused the stream request: {}", msg));
+    }
+    let (status_url, download_url) = poll_urls(&ep.status_base, handoff, name)?;
 
     // Step 3: poll until the track is ready to stream.
     let mut ready = false;
@@ -417,13 +456,24 @@ async fn open_stream_with(
             Ok(resp) if resp.status().is_success() => {
                 transport_errors = 0;
                 if let Ok(status_json) = resp.json::<serde_json::Value>().await {
+                    let ok = status_json
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let status = status_json
                         .get("status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if status == "ready" || status == "done" {
+                    if status == "completed" || status == "ready" || status == "done" {
                         ready = true;
                         break;
+                    }
+                    if status == "error" || !ok {
+                        let msg = status_json
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("processing failed");
+                        return Err(anyhow!("lucida stream failed: {}", msg));
                     }
                 }
             }
@@ -480,51 +530,70 @@ async fn open_stream_with(
 pub const STOCK_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
-/// Extracts the CSRF token from the lucida HTML page.
+/// Extracts the page-data token + expiry from the lucida resolver page.
 ///
-/// The page embeds its data in a script block with `"token":"value"` patterns.
-/// Whitespace around the colon is tolerated (`"token" : "value"`), since
-/// minifiers/pretty-printers vary.
-fn extract_csrf_token(html: &str) -> Option<String> {
-    for key in &["\"token\"", "\"csrf\""] {
-        let mut search_from = 0;
-        while let Some(rel) = html[search_from..].find(key) {
-            let mut after = &html[search_from + rel + key.len()..];
-            after = after.trim_start();
-            if !after.starts_with(':') {
-                search_from += rel + key.len();
-                continue;
+/// SvelteKit serializes page data with `devalue`, i.e. a JS object literal,
+/// not JSON: a resolvable track carries `token:"<b64-of-b64>",tokenExpiry:<ms>`
+/// (bare keys, quoted string value), while an unavailable track carries
+/// `token:null,tokenExpiry:null`.
+///
+/// Returns `None` when no `tokenExpiry` field exists at all (page structure
+/// changed); `(None, 0)` when the page resolves but the track is unavailable.
+/// The lookup scans leftwards from the *last* `tokenExpiry` and requires the
+/// `token:` key to start at a key boundary — the Cloudflare beacon's
+/// `"token":"…"` (quoted key) and substrings inside other identifiers are
+/// skipped.
+fn extract_page_token(html: &str) -> Option<(Option<String>, u64)> {
+    const EXPIRY_KEY: &str = "tokenExpiry:";
+    let pos = html.rfind(EXPIRY_KEY)?;
+    let mut expiry: u64 = 0;
+    for c in html[pos + EXPIRY_KEY.len()..].chars() {
+        match c {
+            '0'..='9' => {
+                expiry = expiry
+                    .saturating_mul(10)
+                    .saturating_add(c as u64 - '0' as u64);
             }
-            after = after[1..].trim_start();
-            if let Some(inner) = after.strip_prefix('"') {
-                let end = inner.find('"')?;
-                return Some(inner[..end].to_string());
-            }
-            search_from += rel + key.len();
+            _ => break,
         }
     }
-    None
+
+    let mut token: Option<String> = None;
+    let mut rest = &html[..pos];
+    while let Some(idx) = rest.rfind("token:") {
+        let before = rest[..idx].chars().last().unwrap_or(',');
+        if !before.is_ascii_alphanumeric() && before != '_' && before != '"' {
+            let after = rest[idx + "token:".len()..].trim_start();
+            if let Some(quoted) = after.strip_prefix('"') {
+                if let Some(end) = quoted.find('"') {
+                    token = Some(quoted[..end].to_string());
+                    break;
+                }
+            } else if after.starts_with("null") {
+                break;
+            }
+        }
+        rest = &rest[..idx];
+    }
+    Some((token, expiry))
 }
 
-/// Extracts the token expiry timestamp from the lucida HTML page.
-fn extract_token_expiry(html: &str) -> Option<u64> {
-    let key = "\"token_expiry\"";
-    let mut search_from = 0;
-    while let Some(rel) = html[search_from..].find(key) {
-        let mut after = html[search_from + rel + key.len()..].trim_start();
-        if !after.starts_with(':') {
-            search_from += rel + key.len();
-            continue;
-        }
-        after = after[1..].trim_start();
-        let end = after.find(|c: char| !c.is_ascii_digit())?;
-        if end == 0 {
-            search_from += rel + key.len();
-            continue;
-        }
-        return after[..end].parse::<u64>().ok();
-    }
-    None
+/// Decodes the page token. The lucida client sends `atob(atob(token))`: the
+/// page value is base64-of-base64 (standard alphabet; URL-safe tolerated).
+fn double_b64_decode(s: &str) -> Option<String> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+    use base64::Engine as _;
+
+    let layer1 = STANDARD
+        .decode(s.trim())
+        .ok()
+        .or_else(|| URL_SAFE.decode(s.trim()).ok())?;
+    let layer1 = String::from_utf8(layer1).ok()?;
+    STANDARD
+        .decode(layer1.trim())
+        .ok()
+        .or_else(|| URL_SAFE.decode(layer1.trim()).ok())
+        .and_then(|v| String::from_utf8(v).ok())
 }
 
 /// Percent-encoding for the lucida resolve URL: the full Spotify track URL
@@ -576,61 +645,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_urls_validated() {
-        let tpl = "https://{server}.lucida.to/api/fetch/request/{handoff}";
-        let (s, d) = status_urls(tpl, "s1", "abc-123_XY").unwrap();
-        assert_eq!(s, "https://s1.lucida.to/api/fetch/request/abc-123_XY");
+    fn poll_urls_validated() {
+        let (p, d) = poll_urls("https://lucida.to", "h1-abc_XY.9~", "track-name").unwrap();
+        assert_eq!(
+            p,
+            "https://lucida.to/api/load?url=%2Fapi%2Ffetch%2Frequest%2Fh1-abc_XY.9~&force=track-name"
+        );
         assert_eq!(
             d,
-            "https://s1.lucida.to/api/fetch/request/abc-123_XY/download"
+            "https://lucida.to/api/load?url=%2Fapi%2Ffetch%2Frequest%2Fh1-abc_XY.9~%2Fdownload&force=track-name&redirect=true"
         );
-        assert!(status_urls(tpl, "", "abc").is_err());
-        assert!(status_urls(tpl, "api", "").is_err());
-        assert!(status_urls(tpl, "evil.com", "abc").is_err());
-        assert!(status_urls(tpl, "a/b", "abc").is_err());
-        assert!(status_urls(tpl, "api", "../x").is_err());
-        assert!(status_urls(tpl, "api", "a b").is_err());
-        assert!(status_urls(tpl, "api", "a?b").is_err());
+        assert!(poll_urls("https://lucida.to", "", "n").is_err());
+        assert!(poll_urls("https://lucida.to", "a/b", "n").is_err());
+        assert!(poll_urls("https://lucida.to", "../x", "n").is_err());
+        assert!(poll_urls("https://lucida.to", "a b", "n").is_err());
+        assert!(poll_urls("https://lucida.to", "a?b", "n").is_err());
+        assert!(poll_urls("https://lucida.to", "h1", "").is_err());
     }
 
     #[test]
-    fn csrf_token_extracted() {
-        let html = r#"<html><body><script>window.settings={"csrf":"aBcD1234","other":1};</script></body></html>"#;
-        assert_eq!(extract_csrf_token(html).as_deref(), Some("aBcD1234"));
+    fn page_token_and_expiry_extracted() {
+        let html = r#"<script>var data=[{...,token:"QUJDRDEyMw==",tokenExpiry:1820000000000},"uses"];</script>"#;
+        let (tok, exp) = extract_page_token(html).unwrap();
+        assert_eq!(tok.as_deref(), Some("QUJDRDEyMw=="));
+        assert_eq!(exp, 1_820_000_000_000);
     }
 
     #[test]
-    fn csrf_token_token_key() {
-        let html = r#"<script>const x={"token":"xyz987","expiry":100};</script>"#;
-        assert_eq!(extract_csrf_token(html).as_deref(), Some("xyz987"));
+    fn page_token_null_when_track_unavailable() {
+        let html = r#"<script>var data=[{...,token:null,tokenExpiry:null},"uses"];</script>"#;
+        let (tok, exp) = extract_page_token(html).unwrap();
+        assert_eq!(tok, None);
+        assert_eq!(exp, 0);
     }
 
     #[test]
-    fn csrf_token_tolerates_whitespace() {
-        let html = r#"<script>const x = { "token" : "spaced123" };</script>"#;
-        assert_eq!(extract_csrf_token(html).as_deref(), Some("spaced123"));
+    fn page_token_ignores_quoted_beacon_token() {
+        // The Cloudflare beacon uses a *quoted* key ("token":) — the page-data
+        // token uses a bare key (token:) and sits right before tokenExpiry.
+        let html = concat!(
+            r#"<script src="beacon.js" data-cf-beacon='{"token":"beecon123"}'></script>"#,
+            r#"<script>var data=[{info:{},token:"cGFnZXZvbyJiYXI=","#,
+            r#"tokenExpiry:77},"uses"];</script>"#,
+        );
+        let (tok, exp) = extract_page_token(html).unwrap();
+        assert_eq!(tok.as_deref(), Some("cGFnZXZvbyJiYXI="));
+        assert_eq!(exp, 77);
     }
 
     #[test]
-    fn csrf_token_missing() {
-        assert_eq!(extract_csrf_token("<html></html>"), None);
+    fn page_token_missing_when_structure_changed() {
+        assert_eq!(extract_page_token("<html>no data</html>"), None);
     }
 
     #[test]
-    fn token_expiry_extracted() {
-        let html = r#"{"token_expiry":1780000000000,"ok":true}"#;
-        assert_eq!(extract_token_expiry(html), Some(1_780_000_000_000));
-    }
-
-    #[test]
-    fn token_expiry_tolerates_whitespace() {
-        let html = r#"{ "token_expiry" : 1780000000000 }"#;
-        assert_eq!(extract_token_expiry(html), Some(1_780_000_000_000));
-    }
-
-    #[test]
-    fn token_expiry_default_when_absent() {
-        assert_eq!(extract_token_expiry("<html></html>"), None);
+    fn double_base64_roundtrip() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let once = STANDARD.encode("tok123-primary");
+        let twice = STANDARD.encode(&once);
+        assert_eq!(double_b64_decode(&twice).as_deref(), Some("tok123-primary"));
+        assert_eq!(double_b64_decode("!!!not-base64!!!"), None);
     }
 
     #[test]
@@ -704,33 +779,46 @@ mod tests {
         LucidaEndpoints {
             base: mock.base_url.clone(),
             api_load: format!("{}/api/load", mock.base_url),
-            status_tpl: format!("{}/status/{{handoff}}", mock.base_url),
+            status_base: mock.base_url.clone(),
         }
     }
 
-    fn resolve_html() -> Vec<u8> {
-        br#"<html><script>var t={"token":"tok123","token_expiry":999};</script></html>"#.to_vec()
+    /// Page token for the mock resolver: twice-base64 of "tok123-primary",
+    /// like the real devalue page-data (`token:"…",tokenExpiry:…`).
+    fn page_token_twice() -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        STANDARD.encode(STANDARD.encode("tok123-primary"))
     }
 
-    /// Full flow against a canned upstream: resolve → token → load →
-    /// processing → ready → download, plain and ranged.
+    fn resolve_html() -> Vec<u8> {
+        format!(
+            "<html><script>var data=[{{info:{{}},token:\"{}\",tokenExpiry:999}},\"uses\"];</script></html>",
+            page_token_twice()
+        )
+        .into_bytes()
+    }
+
+    /// Full flow against a canned upstream: resolve → page token → load →
+    /// processing → completed → download, plain and ranged.
     #[tokio::test]
     async fn full_flow_polls_then_streams_with_range() {
         let mock = MockServer::start(vec![
-            Route::new(
-                "/api/load",
-                vec![(200, br#"{"handoff":"h1","server":"mock"}"#.to_vec())],
-            ),
-            // Suffix first: /status/h1/download must not hit the poll route.
-            Route::new("/status/", vec![(200, MOCK_AUDIO.to_vec())])
-                .ending_with("/download")
+            // Download first: its URL also contains "request".
+            Route::new("/api/load", vec![(200, MOCK_AUDIO.to_vec())])
+                .containing("download")
                 .ranged(),
             Route::new(
-                "/status/",
+                "/api/load",
                 vec![
-                    (200, br#"{"status":"processing"}"#.to_vec()),
-                    (200, br#"{"status":"ready"}"#.to_vec()),
+                    (200, br#"{"success":true,"status":"processing"}"#.to_vec()),
+                    (200, br#"{"success":true,"status":"completed"}"#.to_vec()),
                 ],
+            )
+            .containing("request"),
+            Route::new(
+                "/api/load",
+                vec![(200, br#"{"success":true,"handoff":"h1","name":"n1"}"#.to_vec())],
             ),
             Route::catch_all(200, resolve_html()),
         ])
@@ -770,7 +858,7 @@ mod tests {
         let mock = MockServer::start(vec![
             Route::new(
                 "/api/load",
-                vec![(200, br#"{"handoff":"h1","server":"mock"}"#.to_vec())],
+                vec![(200, br#"{"success":true,"handoff":"h1","name":"n1"}"#.to_vec())],
             ),
             Route::catch_all(200, resolve_html()),
         ])
@@ -779,7 +867,7 @@ mod tests {
         let ep = LucidaEndpoints {
             base: mock.base_url.clone(),
             api_load: format!("{}/api/load", mock.base_url),
-            status_tpl: format!("http://127.0.0.1:{}/status/{{handoff}}", dead),
+            status_base: format!("http://127.0.0.1:{}", dead),
         };
         let client = reqwest::Client::new();
         let err = open_stream_with(

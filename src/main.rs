@@ -12,6 +12,7 @@
 //!   kebabify.exe status       # Show patch status
 //!   kebabify.exe cookie `<user-agent>` `"<cf_clearance=…>"`  # Unlock lucida.to
 //!   kebabify.exe import-cookies  # Open Chrome, solve challenge, auto-store
+//!   kebabify.exe soulseek `<user>` `<pass>`  # Soulseek P2P login (source #1)
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -25,6 +26,7 @@ mod browser_import;
 mod lucida;
 mod patcher;
 mod saavn;
+mod soulseek;
 mod updater;
 
 #[cfg(test)]
@@ -77,7 +79,15 @@ enum Commands {
     #[command(alias = "import")]
     ImportCookies,
 
-    /// Apply patches, launch Spotify supervised, and stop the audio proxy
+    /// Store the Soulseek P2P login (priority #1 FLAC source).
+    /// Written to %APPDATA%\Kebabify\soulseek.txt — write-only, never shown.
+    #[command(alias = "slsk")]
+    Soulseek {
+        /// Soulseek username
+        user: String,
+        /// Soulseek password
+        pass: String,
+    },    /// Apply patches, launch Spotify supervised, and stop the audio proxy
     /// when Spotify exits — the proxy lives exactly as long as Spotify.
     /// Use this (e.g. pinned instead of Spotify) so every Spotify start gets
     /// a proxy and no proxy lingers afterwards.
@@ -103,6 +113,16 @@ async fn print_runtime_state() {
         (true, false) => println!(
             "Cookies stored:        partial (no cf_clearance) — re-run `kebabify import-cookies`"
         ),
+    }
+    // Soulseek is source #1: without a login every track skips it.
+    if soulseek::has_credentials() {
+        println!("Soulseek login:        yes (priority #1 source)");
+    } else {
+        println!("Soulseek login:        no — run `kebabify soulseek <user> <pass>`");
+    }
+    match soulseek::binary_path() {
+        Some(p) if p.is_file() => println!("Soulseek binary:       yes"),
+        _ => println!("Soulseek binary:       missing — put sockseek.exe in %APPDATA%\\Kebabify\\bin\\"),
     }
 }
 
@@ -220,8 +240,7 @@ async fn ensure_proxy() -> Result<()> {
 }
 
 /// Warns when FLAC cannot work for missing cookies (Saavn still does).
-fn warn_no_cookies() {
-    // Without stored Cloudflare cookies every track fails at the
+fn warn_no_cookies() {    // Without stored Cloudflare cookies every track fails at the
     // lucida handshake (HTTP 403 → proxy 502): warn now instead
     // of letting the user discover it track by track.
     if !lucida::has_cf_clearance() {
@@ -230,6 +249,36 @@ fn warn_no_cookies() {
         );
     }
 }
+
+/// Warns when the priority #1 source has no login (the chain still works via
+/// lucida/saavn, but every track skips Soulseek).
+fn warn_no_soulseek() {
+    if !soulseek::has_credentials() {
+        println!(
+            "NOTE: no Soulseek login stored — priority #1 source skipped until you run `kebabify soulseek <user> <pass>`."
+        );
+    }
+}
+
+/// Kills a running Spotify so the freshly patched files actually load.
+/// Spotify is single-instance: without this, `launch_spotify_uri()` only
+/// wakes the old window and the new JS/CSS never take effect (silent stale
+/// client — the exact confusion this fixes). Windows-only; best effort.
+#[cfg(target_os = "windows")]
+fn restart_spotify_for_patch() {
+    let killed = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "Spotify.exe"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if killed {
+        println!("Closed the running Spotify so the new patch loads on restart.");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restart_spotify_for_patch() {}
 
 /// Launches Spotify via its `spotify:` URI (no process handle — fire and
 /// forget, used when the exe path is unknown or supervision isn't wanted).
@@ -329,6 +378,18 @@ async fn cmd_import_cookies() -> Result<()> {
     browser_import::import_from_browser().await
 }
 
+/// Stores the Soulseek login. The password is write-only: confirmed by path,
+/// never echoed back.
+async fn cmd_soulseek(user: String, pass: String) -> Result<()> {
+    if user.trim().is_empty() || pass.is_empty() {
+        return Err(anyhow::anyhow!("Soulseek username and password must not be empty"));
+    }
+    let path = soulseek::save_credentials(&user, &pass)?;
+    println!("kebabify — Soulseek login stored ({}).", path.display());
+    println!("The audio proxy will use it as the priority #1 FLAC source.");
+    Ok(())
+}
+
 /// Self-update: check, download, stage, hand over to the swap helper, exit.
 /// The helper relaunches `apply`, so the new version re-patches immediately.
 async fn cmd_update() -> Result<()> {
@@ -386,7 +447,9 @@ async fn cmd_apply() -> Result<()> {
     println!("Patches applied successfully!");
 
     ensure_proxy().await?;
+    warn_no_soulseek();
     warn_no_cookies();
+    restart_spotify_for_patch();
     launch_spotify_uri();
     Ok(())
 }
@@ -403,7 +466,12 @@ async fn cmd_run() -> Result<()> {
     println!("Patches applied successfully!");
 
     ensure_proxy().await?;
+    warn_no_soulseek();
     warn_no_cookies();
+
+    // Supervised mode needs a real child, not a single-instance handoff to
+    // an already-running Spotify (which would exit at once and kill the proxy).
+    restart_spotify_for_patch();
 
     let exe = match patcher::spotify_exe_path() {
         Ok(exe) => exe,
@@ -548,6 +616,9 @@ async fn main() -> Result<()> {
             cmd_cookie(user_agent, cookie, force).await?;
         }
         Some(Commands::ImportCookies) => cmd_import_cookies().await?,
+        Some(Commands::Soulseek { user, pass }) => {
+            cmd_soulseek(user, pass).await?;
+        }
         Some(Commands::AudioProxyOnly) => {
             // Hidden mode: run only the audio proxy as a detached process.
             // This is spawned by the main kebabify.exe process.
