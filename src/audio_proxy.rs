@@ -394,10 +394,10 @@ static UPDATE_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time::I
 /// [`crate::updater::CHECK_TTL`]. Errors resolve to "no update" and are NOT
 /// cached, so recovery after an outage is immediate.
 async fn cached_update_check(client: &reqwest::Client) -> String {
-    if let Some((at, body)) = UPDATE_CACHE.lock().await.clone() {
-        if at.elapsed() < crate::updater::CHECK_TTL {
-            return body;
-        }
+    if let Some((at, body)) = UPDATE_CACHE.lock().await.clone()
+        && at.elapsed() < crate::updater::CHECK_TTL
+    {
+        return body;
     }
     // Errors are deliberately NOT cached: an offline proxy would otherwise
     // report "no update" for a full hour.
@@ -721,10 +721,10 @@ async fn handle_client(
     // ===== Admin endpoints =====
     if endpoint == Endpoint::Health {
         // Only answer to requests from allowed origins (or non-browser clients).
-        if let Some(o) = origin.as_deref() {
-            if !is_allowed_origin(o) {
-                return Err(anyhow!("Forbidden origin for /health: {}", o));
-            }
+        if let Some(o) = origin.as_deref()
+            && !is_allowed_origin(o)
+        {
+            return Err(anyhow!("Forbidden origin for /health: {}", o));
         }
 
         // The now-playing track ID is listening-habit data: only allowlisted
@@ -763,10 +763,10 @@ async fn handle_client(
     if endpoint == Endpoint::UpdateCheck {
         // Same origin rule as /health: allowlisted callers, or non-browser
         // clients with no Origin at all.
-        if let Some(o) = origin.as_deref() {
-            if !is_allowed_origin(o) {
-                return Err(anyhow!("Forbidden origin for /update/check: {}", o));
-            }
+        if let Some(o) = origin.as_deref()
+            && !is_allowed_origin(o)
+        {
+            return Err(anyhow!("Forbidden origin for /update/check: {}", o));
         }
         let body = cached_update_check(&client).await;
         let resp = json_response("HTTP/1.1 200 OK", &body, origin.as_deref());
@@ -1077,11 +1077,10 @@ async fn handle_client(
             cors_header_line(origin.as_deref())
         );
         for name in ["content-range", "accept-ranges", "content-length"] {
-            if let Some(v) = audio_resp.headers().get(name) {
-                if let Ok(s) = v.to_str() {
+            if let Some(v) = audio_resp.headers().get(name)
+                && let Ok(s) = v.to_str() {
                     response_header.push_str(&format!("\r\n{}: {}", name, s));
                 }
-            }
         }
         response_header.push_str("\r\n\r\n");
 
@@ -1540,10 +1539,9 @@ fn extract_track_id(url: &str) -> Option<String> {
         if let Some(id) = parsed
             .query_pairs()
             .find(|(k, _)| k == "track_id" || k == "id" || k == "cid")
+            && is_track_id(&id.1)
         {
-            if is_track_id(&id.1) {
-                return Some(id.1.to_string());
-            }
+            return Some(id.1.to_string());
         }
     }
 
