@@ -27,7 +27,9 @@ mod lucida;
 mod patcher;
 mod saavn;
 mod shutdown_token;
+mod sockseek_install;
 mod soulseek;
+mod supervisor;
 mod updater;
 
 #[cfg(test)]
@@ -98,6 +100,11 @@ enum Commands {
     /// Hidden: run only the audio proxy as a detached process
     #[command(hide = true)]
     AudioProxyOnly,
+
+    /// Hidden: watch Spotify and keep the audio proxy tied to its lifetime.
+    /// Installed at login by `apply`; not meant to be run by hand.
+    #[command(hide = true)]
+    Supervise,
 }
 
 /// Proxy + cookie state for `status` (and the no-Spotify branch): independent
@@ -258,10 +265,79 @@ fn warn_no_cookies() {
 /// Warns when the priority #1 source has no login (the chain still works via
 /// lucida/saavn, but every track skips Soulseek).
 fn warn_no_soulseek() {
+    if !sockseek_install::is_installed() {
+        println!("NOTE: {}", sockseek_install::install_hint());
+    }
     if !soulseek::has_credentials() {
         println!(
             "NOTE: no Soulseek login stored — priority #1 source skipped until you run `kebabify soulseek <user> <pass>`."
         );
+    }
+}
+
+/// Installs the pinned Soulseek downloader on first use: 50 MB, verified
+/// against a SHA-256 compiled into the binary, extracted to the per-user data
+/// dir. A failure is never fatal — the chain falls back to lucida/Saavn.
+async fn ensure_soulseek_downloader() {
+    if sockseek_install::is_installed() {
+        return;
+    }
+    match sockseek_install::ensure_installed(&reqwest::Client::new()).await {
+        Ok(()) => println!(
+            "Soulseek downloader ready: {}",
+            soulseek::binary_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "installed".to_string())
+        ),
+        Err(e) => println!(
+            "NOTE: Soulseek downloader not installed ({:#}).\n       {}",
+            e,
+            sockseek_install::install_hint()
+        ),
+    }
+}
+
+/// Ties the audio proxy to Spotify's lifetime: a per-user autostart entry
+/// launches the watcher at login, and the watcher starts the proxy when
+/// Spotify appears and stops it when Spotify exits. `uninstall` removes it.
+fn link_proxy_to_spotify(start_watcher_now: bool) {
+    if !supervisor::is_supported() {
+        println!(
+            "NOTE: automatic proxy/Spotify linking is Windows-only on this build — use `kebabify run` to supervise manually."
+        );
+        return;
+    }
+    match supervisor::install_autostart() {
+        Ok(()) => println!(
+            "Autostart installed — the proxy will follow Spotify ({}).",
+            supervisor::autostart_command().unwrap_or_else(|_| "HKCU Run".to_string())
+        ),
+        Err(e) => println!(
+            "NOTE: could not install the autostart entry ({:#}) — use `kebabify run` to supervise manually.",
+            e
+        ),
+    }
+    if start_watcher_now {
+        spawn_watcher_detached();
+    }
+}
+
+/// Starts `kebabify supervise` as a hidden detached process. A watcher that
+/// is already running claims the instance lock and exits, so repeated
+/// `apply` calls do not pile up watchers.
+fn spawn_watcher_detached() {
+    let Ok(exe) = std::env::current_exe() else {
+        println!("NOTE: cannot locate kebabify.exe to start the watcher.");
+        return;
+    };
+    let (child_out, child_err) = proxy_stdio();
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("supervise").stdout(child_out).stderr(child_err);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    match cmd.spawn() {
+        Ok(_) => println!("Proxy/Spotify watcher started (Ctrl+C or logout to stop it)."),
+        Err(e) => println!("NOTE: could not start the proxy/Spotify watcher: {}", e),
     }
 }
 
@@ -343,6 +419,12 @@ async fn cmd_uninstall() -> Result<()> {
             eprintln!("  Removed: staged update");
         }
     }
+    // The autostart entry would keep re-arming a proxy for an unpatched
+    // Spotify, so it goes with the patches.
+    match supervisor::remove_autostart() {
+        Ok(()) => eprintln!("  Removed: autostart entry"),
+        Err(e) => eprintln!("  NOTE: could not remove the autostart entry: {:#}", e),
+    }
     match require_patcher() {
         Ok(p) => {
             p.uninstall_patches()?;
@@ -366,6 +448,7 @@ async fn cmd_update_ext() -> Result<()> {
 }
 
 async fn cmd_status() -> Result<()> {
+    print_link_state();
     match require_patcher() {
         Ok(p) => {
             p.print_status()?;
@@ -379,6 +462,30 @@ async fn cmd_status() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reports the proxy/Spotify link and the Soulseek downloader, both of which
+/// live outside the Spotify install.
+fn print_link_state() {
+    if supervisor::is_supported() {
+        match supervisor::autostart_command() {
+            Ok(command) => println!("Autostart command:     {command}"),
+            Err(e) => println!("Autostart command:     unavailable ({e:#})"),
+        }
+    } else {
+        println!("Autostart command:     unsupported on this platform");
+    }
+    let downloader = soulseek::binary_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "no per-user data dir".to_string());
+    println!(
+        "Soulseek downloader:   {}",
+        if sockseek_install::is_installed() {
+            downloader
+        } else {
+            format!("missing (expected {})", downloader)
+        }
+    );
 }
 
 async fn cmd_cookie(user_agent: String, cookie: String, force: bool) -> Result<()> {
@@ -494,8 +601,10 @@ async fn cmd_apply() -> Result<()> {
     println!("Patches applied successfully!");
 
     ensure_proxy().await?;
+    ensure_soulseek_downloader().await;
     warn_no_soulseek();
     warn_no_cookies();
+    link_proxy_to_spotify(true);
     restart_spotify_for_patch();
     launch_spotify_uri();
     Ok(())
@@ -508,11 +617,15 @@ async fn cmd_run() -> Result<()> {
     println!("Patches applied successfully!");
 
     ensure_proxy().await?;
+    ensure_soulseek_downloader().await;
     warn_no_soulseek();
     warn_no_cookies();
 
     // Supervised mode needs a real child, not a single-instance handoff to
     // an already-running Spotify (which would exit at once and kill the proxy).
+    // This command IS the supervision for the session, so the login watcher is
+    // installed (for the next sessions) but not started alongside it.
+    link_proxy_to_spotify(false);
     restart_spotify_for_patch();
 
     let exe = match patcher::spotify_exe_path() {
@@ -560,6 +673,30 @@ async fn cmd_run() -> Result<()> {
     println!("Spotify exited, stopping the audio proxy (re-run `run` next launch)...");
     stop_proxy().await;
     Ok(())
+}
+
+/// The watcher half of the Spotify/proxy link: polls for Spotify and keeps the
+/// proxy in the matching state until interrupted. One instance only, guarded
+/// by a pid lock file, so a stray second copy exits immediately.
+async fn cmd_supervise() -> Result<()> {
+    let _lock = match supervisor::acquire_instance_lock()? {
+        Some(lock) => lock,
+        None => {
+            println!("A proxy/Spotify watcher is already running — nothing to do.");
+            return Ok(());
+        }
+    };
+    println!("kebabify — watching Spotify (proxy follows it). Ctrl+C to stop watching.");
+    supervisor::supervise(
+        || async { Ok(supervisor::spotify_running()) },
+        || async { Ok(audio_proxy::AudioProxy::is_running().await) },
+        || async { ensure_proxy().await },
+        || async {
+            stop_proxy().await;
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Choice offered by the interactive menu (double-click, no PowerShell).
@@ -672,6 +809,9 @@ async fn main() -> Result<()> {
             // This is spawned by the main kebabify.exe process.
             let proxy = audio_proxy::AudioProxy::new(audio_proxy::PROXY_PORT);
             proxy.start().await?;
+        }
+        Some(Commands::Supervise) => {
+            cmd_supervise().await?;
         }
     }
 
