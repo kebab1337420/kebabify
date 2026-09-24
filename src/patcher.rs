@@ -93,12 +93,12 @@ impl SpotifyPatcher {
         // The index.html is already restored from backup above, but if the backup
         // contains an old-style kebaccify script tag, we need to remove it
         let index_path = self.xpui_dir.join("index.html");
-        if index_path.exists() {
-            if let Ok(mut content) = std::fs::read_to_string(&index_path) {
-                strip_extension_scripts(&mut content);
+        if index_path.exists()
+            && let Ok(mut content) = std::fs::read_to_string(&index_path)
+        {
+            strip_extension_scripts(&mut content);
 
-                let _ = std::fs::write(&index_path, &content);
-            }
+            let _ = std::fs::write(&index_path, &content);
         }
 
         eprintln!("  Restored: user.css");
@@ -171,16 +171,16 @@ impl SpotifyPatcher {
     /// from "backups lost" on uninstall without backups.
     fn has_patch_markers(&self) -> bool {
         let css = self.xpui_dir.join("user.css");
-        if let Ok(content) = std::fs::read_to_string(&css) {
-            if content.contains("kebabify_start") || content.contains("kebaccify_start") {
-                return true;
-            }
+        if let Ok(content) = std::fs::read_to_string(&css)
+            && (content.contains("kebabify_start") || content.contains("kebaccify_start"))
+        {
+            return true;
         }
         let index = self.xpui_dir.join("index.html");
-        if let Ok(content) = std::fs::read_to_string(&index) {
-            if content.contains("kebabify_ext") || content.contains("kebaccify_ext") {
-                return true;
-            }
+        if let Ok(content) = std::fs::read_to_string(&index)
+            && (content.contains("kebabify_ext") || content.contains("kebaccify_ext"))
+        {
+            return true;
         }
         ["kebabify_ext.js", "kebaccify_ext.js"]
             .iter()
@@ -447,13 +447,13 @@ impl SpotifyPatcher {
         let Ok(config_path) = spicetify_config_path(&extensions_dir) else {
             return Ok(());
         };
-        if config_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                let mut updated = set_config_extensions(&content, "kebabify_ext.js", false);
-                updated = set_config_extensions(&updated, "kebaccify_ext.js", false);
-                if updated != content {
-                    let _ = std::fs::write(&config_path, &updated);
-                }
+        if config_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&config_path)
+        {
+            let mut updated = set_config_extensions(&content, "kebabify_ext.js", false);
+            updated = set_config_extensions(&updated, "kebaccify_ext.js", false);
+            if updated != content {
+                let _ = std::fs::write(&config_path, &updated);
             }
         }
         eprintln!("  Removed: Spicetify ext registration");
@@ -649,12 +649,12 @@ fn find_spotify_install() -> Result<PathBuf> {
             return Ok(dir);
         }
 
-        if let Ok(exe) = which::which("spotify") {
-            if let Some(parent) = exe.parent() {
-                let spotify_path = parent.to_path_buf();
-                if spotify_path.join("Apps").join("xpui").exists() {
-                    return Ok(spotify_path);
-                }
+        if let Ok(exe) = which::which("spotify")
+            && let Some(parent) = exe.parent()
+        {
+            let spotify_path = parent.to_path_buf();
+            if spotify_path.join("Apps").join("xpui").exists() {
+                return Ok(spotify_path);
             }
         }
 

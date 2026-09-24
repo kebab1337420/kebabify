@@ -100,10 +100,10 @@ fn load_session() -> Option<CloudflareSession> {
     if let Some(s) = read_session(&cookies_path()) {
         return Some(s);
     }
-    if let Some(legacy) = legacy_cookies_path() {
-        if legacy != cookies_path() {
-            return read_session(&legacy);
-        }
+    if let Some(legacy) = legacy_cookies_path()
+        && legacy != cookies_path()
+    {
+        return read_session(&legacy);
     }
     None
 }
@@ -185,10 +185,10 @@ pub fn save_cookies(user_agent: &str, cookie_header: &str) -> Result<()> {
         .with_context(|| format!("Failed to move {} into place", path.display()))?;
     // A legacy Kebaccify file would otherwise rot forever, never read again
     // now that the new path exists.
-    if let Some(legacy) = legacy_cookies_path() {
-        if legacy != path {
-            let _ = std::fs::remove_file(&legacy);
-        }
+    if let Some(legacy) = legacy_cookies_path()
+        && legacy != path
+    {
+        let _ = std::fs::remove_file(&legacy);
     }
     Ok(())
 }
