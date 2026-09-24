@@ -64,7 +64,6 @@ fn temp_token_path(path: &std::path::Path, attempt: u64) -> std::path::PathBuf {
 }
 
 fn mint_token(counter: u64) -> String {
-    use sha2::{Digest, Sha256};
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
 
@@ -82,7 +81,7 @@ fn mint_token(counter: u64) -> String {
     let mut second = RandomState::new().build_hasher();
     second.write(seed.as_bytes());
     let material = format!("{}:{}:{}", first.finish(), second.finish(), seed);
-    format!("{:x}", Sha256::digest(material.as_bytes()))
+    crate::digest::sha256_hex(material.as_bytes())
 }
 
 fn install_token(path: &std::path::Path, token: &str) -> Result<String> {
