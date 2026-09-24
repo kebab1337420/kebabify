@@ -114,11 +114,11 @@ fn install_token(path: &std::path::Path, token: &str) -> Result<String> {
             let _ = std::fs::remove_file(&tmp);
             return Ok(existing);
         }
-        if let Ok(metadata) = std::fs::symlink_metadata(path) {
-            if metadata.file_type().is_symlink() {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(anyhow!("Refusing to replace symlink {}", path.display()));
-            }
+        if let Ok(metadata) = std::fs::symlink_metadata(path)
+            && metadata.file_type().is_symlink()
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!("Refusing to replace symlink {}", path.display()));
         }
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(token.to_string()),

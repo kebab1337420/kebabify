@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "kebabify"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -715,6 +715,7 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "which",
+ "windows-sys 0.61.2",
  "winreg",
  "winres",
 ]
