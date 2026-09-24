@@ -2,13 +2,13 @@
 
 Spicetify-like patcher for the Spotify desktop client: ad-free playback, lossless (FLAC) audio via Soulseek P2P and the [lucida.to](https://lucida.to) API with Saavn fallback, and a small theme/extension bundle.
 
-**No PowerShell needed**: double-click `kebabify.exe` and pick an action from the interactive menu (French).
+**No PowerShell needed** for everyday use: double-click `kebabify.exe` and pick an action from the interactive menu (French). The one exception is the optional Soulseek downloader, which `apply` fetches and unpacks with the Windows built-in PowerShell on first use — skip it and nothing else needs a shell.
 
 ## Requirements
 
 - Spotify desktop app (Windows)
 - A supported browser, only for `import-cookies` (Chromium: Chrome, Edge, Brave, Vivaldi, Opera, Arc — Firefox family: Firefox, Zen, LibreWolf, Waterfox)
-- The external `sockseek.exe` binary for the optional Soulseek source, placed in `%APPDATA%\Kebabify\bin\` or available on `PATH`
+- The external `sockseek.exe` for the optional Soulseek source — `apply` downloads it automatically on first use, or you can place it in `%APPDATA%\Kebabify\bin\` yourself (or on `PATH`)
 
 ## Install & use
 
@@ -26,7 +26,9 @@ kebabify.exe uninstall    # restore Spotify originals (aliases: restore, remove)
 
 `audio-proxy-only` also exists but is internal (spawned detached by `apply`/`run`).
 
-Pin `kebabify.exe run` instead of Spotify if you want the proxy to live exactly as long as Spotify (no lingering process, fresh proxy on every start). Ctrl+C stops the proxy but leaves Spotify playing. Exception: if Spotify was already running, `run` hands off to it and behaves like `apply` (proxy left running).
+The audio proxy follows Spotify's lifetime. `apply` installs a per-user autostart entry (`HKCU\...\CurrentVersion\Run`, no admin rights) and starts a small watcher: the proxy comes up when Spotify appears and goes down when it quits — including when Spotify is started from its own shortcut. A pid lock keeps a single watcher; a crashed one is detected and replaced. `uninstall` removes the entry.
+
+Pin `kebabify.exe run` instead of Spotify if you want a supervised launch without the watcher (proxy lives exactly as long as the Spotify process it started, fresh proxy on every start). Ctrl+C stops the proxy but leaves Spotify playing. Exception: if Spotify was already running, `run` hands off to it and behaves like `apply` (proxy left running).
 
 ## Self-update
 
@@ -34,7 +36,7 @@ Pin `kebabify.exe run` instead of Spotify if you want the proxy to live exactly 
 
 ## Audio sources and cookies
 
-Soulseek is the first source when both its credentials and the external `sockseek.exe` downloader are available. Install `sockseek.exe` in `%APPDATA%\Kebabify\bin\` (or make it available on `PATH`), then configure the login with:
+Soulseek is the first source when both its credentials and the external `sockseek.exe` downloader are available. `apply` installs the downloader automatically on first use: it downloads the pinned upstream release (SHA-256 compiled into the binary) into `%APPDATA%\Kebabify\bin\`. It is not embedded in `kebabify.exe` because sockseek is **AGPL-3.0** and its executable is 114 MB. You can also place `sockseek.exe` there yourself, or make it available on `PATH`. Then configure the login with:
 
 ```powershell
 kebabify.exe soulseek <user> <pass>
@@ -58,7 +60,7 @@ While Spotify plays, the extension redirects audio requests to a local proxy on 
 ## Uninstall
 
 ```powershell
-kebabify.exe uninstall   # stops the proxy, restores originals, deletes backup dirs + proxy log (clean-reinstall ready; cookies are kept)
+kebabify.exe uninstall   # stops the proxy, removes the autostart entry, restores originals, deletes backup dirs + proxy log (clean-reinstall ready; cookies are kept)
 ```
 
 ## Develop
