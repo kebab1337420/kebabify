@@ -661,7 +661,7 @@ async fn details_media_url(
 /// DES-ECB, key `38346591` (cf. sumitkolhe/jiosaavn-api `link.helper.ts`).
 fn decrypt_media_url(enc: &str) -> Result<String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+    use cipher::{BlockCipherDecrypt, KeyInit};
     use des::Des;
 
     let mut data = STANDARD
@@ -672,10 +672,9 @@ fn decrypt_media_url(enc: &str) -> Result<String> {
     }
     let cipher =
         Des::new_from_slice(b"38346591").map_err(|e| anyhow!("Saavn: bad DES key: {}", e))?;
-    // as_chunks_mut needs Rust 1.88+; chunks_mut + try_into keeps MSRV 1.85.
     for chunk in data.chunks_mut(8) {
         let block: &mut [u8; 8] = chunk.try_into().expect("Saavn: length is a multiple of 8");
-        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+        cipher.decrypt_block((&mut *block).into());
     }
     // PKCS#7 unpad.
     let pad = *data.last().unwrap() as usize;
@@ -918,16 +917,15 @@ mod tests {
     /// `encrypted_media_url` pointing back at the mock (fully offline).
     fn encrypt_media_url(plain: &str) -> String {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
-        use cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        use cipher::{BlockCipherEncrypt, KeyInit};
         use des::Des;
         let mut data = plain.as_bytes().to_vec();
         let pad = 8 - (data.len() % 8);
         data.extend(std::iter::repeat_n(pad as u8, pad));
         let cipher = Des::new_from_slice(b"38346591").unwrap();
-        // as_chunks_mut needs Rust 1.88+; chunks_mut + try_into keeps MSRV.
         for chunk in data.chunks_mut(8) {
             let block: &mut [u8; 8] = chunk.try_into().unwrap();
-            cipher.encrypt_block(GenericArray::from_mut_slice(block));
+            cipher.encrypt_block((&mut *block).into());
         }
         STANDARD.encode(&data)
     }

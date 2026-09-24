@@ -352,12 +352,7 @@ async fn verify_checksum(
 
 /// Hex SHA-256 of a file. Pure IO, no network.
 fn sha256_file(path: &std::path::Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("Cannot hash {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("Failed to hash update file")?;
-    Ok(format!("{:x}", hasher.finalize()))
+    crate::digest::sha256_file_hex(path).with_context(|| format!("Cannot hash {}", path.display()))
 }
 
 /// `kebabify.exe` → `kebabify.exe.new` staged next to it.
@@ -611,10 +606,7 @@ mod tests {
     #[tokio::test]
     async fn download_verified_and_tamper_rejected() {
         let payload = vec![65u8; 2048];
-        let expected = {
-            use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(&payload))
-        };
+        let expected = crate::digest::sha256_hex(&payload);
         let mock = MockServer::start(vec![
             Route::new("/file", vec![(200, payload.clone())]),
             Route::new(

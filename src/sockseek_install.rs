@@ -254,13 +254,8 @@ fn verify_file_hash(path: &Path, expected: &str, expected_size: u64) -> Result<(
         return Err(anyhow!("{} has an unexpected size", path.display()));
     }
 
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| anyhow!("Cannot open {}: {}", path.display(), error))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
+    let actual = crate::digest::sha256_file_hex(path)
         .map_err(|error| anyhow!("Cannot hash {}: {}", path.display(), error))?;
-    let actual = format!("{:x}", hasher.finalize());
     if !hash_matches(&actual, expected) {
         return Err(anyhow!("{} failed SHA-256 verification", path.display()));
     }

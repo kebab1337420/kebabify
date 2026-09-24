@@ -23,6 +23,7 @@ use std::process::Stdio;
 
 mod audio_proxy;
 mod browser_import;
+mod digest;
 mod lucida;
 mod patcher;
 mod saavn;
