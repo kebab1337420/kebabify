@@ -26,7 +26,7 @@ sha2 = "0.10"
 # JioSaavn media URL decryption (DES-ECB, see saavn.rs)
 des = "0.8"
 cipher = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 
 # Percent-encoding for the lucida resolve URL (already in the tree via url/reqwest)
 percent-encoding = "2"
