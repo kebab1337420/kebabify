@@ -24,7 +24,7 @@ serde_json = "1"
 sha2 = "0.10"
 
 # JioSaavn media URL decryption (DES-ECB, see saavn.rs)
-des = "0.8"
+des = "0.9"
 cipher = "0.4"
 base64 = "0.22"
 
