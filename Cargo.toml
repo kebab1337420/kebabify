@@ -38,7 +38,7 @@ futures-util = "0.3"
 # Firefox-family cookie store (cookies.sqlite) for the cookie import.
 # Optional: `--no-default-features` drops bundled SQLite (Chromium CDP
 # import keeps working; Firefox import errors politely).
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 [features]
 default = ["firefox-import"]
