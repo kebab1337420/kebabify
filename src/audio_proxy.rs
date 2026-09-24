@@ -1,4 +1,4 @@
-﻿//! Audio proxy server — intercepts Spotify audio requests and redirects to FLAC.
+//! Audio proxy server — intercepts Spotify audio requests and redirects to FLAC.
 //!
 //! Runs a local HTTP server on 127.0.0.1:18900. When Spotify sends an audio
 //! request (to audio-spclient.wg.spotify.com), the JS layer redirects it to
@@ -32,6 +32,31 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// a slow sender hold a connection slot nearly forever within the 8K cap.
 const HEADER_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard cap on the request head, enforced while reading (not after): a line
+/// without CRLF must not be allowed to allocate past this.
+const MAX_HEADER_BYTES: usize = 8192;
+
+/// Maximum number of simultaneous client connections. Admission happens at
+/// accept time, before a task is spawned: the audio semaphore alone let a
+/// flood of half-open connections occupy every task and socket.
+const MAX_CONNECTIONS: usize = 128;
+
+/// Per-write budget for the downstream socket. `STREAM_IDLE_TIMEOUT` only
+/// bounds the upstream; a player that stops reading must not pin a stream
+/// slot forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ceiling on one relayed body. A healthy FLAC is far below this, so hitting
+/// it means a broken or hostile upstream, not a long track.
+const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Absolute lifetime cap for one relayed stream.
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
+
+/// Consecutive accept errors tolerated before the listener is considered dead
+/// (descriptor exhaustion, socket-table pressure) instead of spinning.
+const ACCEPT_MAX_ERRORS: u32 = 16;
+
 /// Maximum number of simultaneous client connections.
 const MAX_CONCURRENT: usize = 64;
 
@@ -53,6 +78,33 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Grace period for in-flight streams after shutdown before teardown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Single-flight guard for `/update/apply`: concurrent callers shared one
+/// fixed staging path and could truncate or delete each other's download.
+static UPDATE_INFLIGHT: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Latches the shutdown flag and guarantees the accept loop is woken, even
+/// when the response write or the helper spawn fails on the way out. A latch
+/// without a wake leaves the proxy bound but unresponsive.
+struct ShutdownLatch {
+    flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl ShutdownLatch {
+    fn trip(&self) {
+        if !self.flag.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ShutdownLatch {
+    fn drop(&mut self) {
+        self.trip();
+    }
+}
 
 /// One shared client for the lightweight control calls (health/shutdown
 /// probes). Building a `Client` per call wastes a connection pool + TLS
@@ -79,6 +131,8 @@ pub struct AudioProxy {
     client: reqwest::Client,
     /// Bounds concurrent connections to avoid a trivial local DoS.
     semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds accepted sockets (including ones that never send a request).
+    conn_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AudioProxy {
@@ -103,6 +157,7 @@ impl AudioProxy {
             shutting_down: Arc::new(AtomicBool::new(false)),
             client,
             semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)),
+            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         }
     }
 
@@ -113,8 +168,12 @@ impl AudioProxy {
             .await
             .context("Failed to bind audio proxy. Port may be in use.")?;
         // Mint the per-boot shutdown token before serving: only readers of
-        // our own APPDATA dir can stop this instance from here on.
-        crate::shutdown_token::load_or_create().context("Failed to mint shutdown token")?;
+        // our own APPDATA dir can stop this instance from here on. The value
+        // is kept in memory for the lifetime of the loop, so deleting the
+        // file on disk cannot make the check fail open.
+        let admin_token = Arc::new(
+            crate::shutdown_token::load_or_create().context("Failed to mint shutdown token")?,
+        );
 
         println!(
             "[kebabify] Audio proxy listening on {}:{}",
@@ -124,8 +183,15 @@ impl AudioProxy {
         // Tracked so shutdown drains in-flight streams instead of aborting
         // them mid-chunk when the runtime tears down.
         let mut tasks = tokio::task::JoinSet::new();
+        let mut consecutive_errors: u32 = 0;
+        let mut rejected: u64 = 0;
 
         loop {
+            // Reap finished tasks: JoinSet keeps every completed entry (and
+            // its output) alive until join_all, so a long-lived proxy would
+            // accumulate them for as long as it serves.
+            while tasks.try_join_next().is_some() {}
+
             // Check the latched flag before each select: if a /shutdown arrived
             // in the window where no waiter was registered, the Notify alone
             // would be missed and the proxy would need a second /shutdown.
@@ -141,10 +207,24 @@ impl AudioProxy {
                 }
                 accepted = listener.accept() => accepted,
             } {
-                Ok(conn) => conn,
+                Ok(conn) => {
+                    consecutive_errors = 0;
+                    conn
+                }
                 Err(e) => {
-                    // Transient accept errors must not kill the whole proxy.
+                    // Transient accept errors must not kill the whole proxy,
+                    // but a persistent one (descriptor exhaustion) must not
+                    // spin a worker at 100% CPU either.
+                    consecutive_errors += 1;
                     eprintln!("[kebabify] Proxy accept error: {}", e);
+                    if consecutive_errors >= ACCEPT_MAX_ERRORS {
+                        return Err(anyhow!(
+                            "Proxy listener failing repeatedly ({} consecutive errors): {}",
+                            consecutive_errors,
+                            e
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
             };
@@ -152,18 +232,35 @@ impl AudioProxy {
             // out immediately instead of waiting for a delayed ACK.
             let _ = socket.set_nodelay(true);
 
+            // Admission before spawning: the audio semaphore is taken later
+            // (admin endpoints must stay live while all stream slots are
+            // busy), so without this a flood of silent connections would
+            // occupy a task and a socket each.
+            let conn_permit = match self.conn_semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    rejected += 1;
+                    if rejected % 64 == 1 {
+                        eprintln!(
+                            "[kebabify] Connection limit reached ({}), dropping new connections",
+                            MAX_CONNECTIONS
+                        );
+                    }
+                    drop(socket);
+                    continue;
+                }
+            };
+
             let current_track = self.current_track.clone();
             let current_source = self.current_source.clone();
             let shutting_down = self.shutting_down.clone();
             let shutdown = self.shutdown.clone();
             let client = self.client.clone();
             let semaphore = self.semaphore.clone();
+            let admin_token = admin_token.clone();
 
-            // No permit taken here on purpose: the request head is read and
-            // classified inside `handle_client`, and admin endpoints
-            // (/health, /shutdown) never take a permit — they stay
-            // responsive even when all 64 stream slots are busy.
             tasks.spawn(async move {
+                let _conn_permit = conn_permit;
                 if let Err(e) = handle_client(
                     socket,
                     current_track,
@@ -172,6 +269,7 @@ impl AudioProxy {
                     shutdown,
                     client,
                     semaphore,
+                    admin_token,
                 )
                 .await
                 {
@@ -353,7 +451,7 @@ async fn serve_file<W: tokio::io::AsyncWrite + Unpin>(
     origin: Option<&str>,
     headers_only: bool,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     let (status_line, content_range, start, end) =
         match range.and_then(|r| parse_range_header(r, len)) {
@@ -376,8 +474,8 @@ async fn serve_file<W: tokio::io::AsyncWrite + Unpin>(
         header.push_str(&format!("\r\nContent-Range: {}", cr));
     }
     header.push_str("\r\n\r\n");
-    writer.write_all(header.as_bytes()).await?;
-    writer.flush().await?;
+    write_bounded(writer, header.as_bytes()).await?;
+    flush_bounded(writer).await?;
 
     if !headers_only {
         let mut file = tokio::fs::File::open(path)
@@ -386,11 +484,22 @@ async fn serve_file<W: tokio::io::AsyncWrite + Unpin>(
         file.seek(std::io::SeekFrom::Start(start))
             .await
             .context("Failed to seek cached FLAC")?;
-        let mut limited = file.take(body_len);
-        tokio::io::copy(&mut limited, writer)
-            .await
-            .context("Failed to send cached FLAC")?;
-        writer.flush().await?;
+        // Chunked with a per-step budget instead of `tokio::copy`: a reader
+        // that stalls (or stops reading) must not pin the stream slot.
+        let mut remaining = body_len;
+        let mut buf = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let read = tokio::time::timeout(STREAM_IDLE_TIMEOUT, file.read(&mut buf[..want]))
+                .await
+                .context("Cached FLAC read stalled")??;
+            if read == 0 {
+                return Err(anyhow!("Cached FLAC ended {} bytes early", remaining));
+            }
+            write_bounded(writer, &buf[..read]).await?;
+            remaining -= read as u64;
+        }
+        flush_bounded(writer).await?;
     }
     Ok(())
 }
@@ -428,10 +537,83 @@ fn parse_range_header(range: &str, len: u64) -> Option<(u64, u64)> {
     }
 }
 
+/// Accumulates a request head from raw socket reads, enforcing the byte cap
+/// *while* reading. `read_line` would grow its String to whatever the peer
+/// sends before any check runs, so a single line without CRLF could allocate
+/// megabytes per connection. Pure for tests.
+struct HeadReader {
+    block: String,
+    pending: Vec<u8>,
+}
+
+impl HeadReader {
+    fn new() -> Self {
+        Self {
+            block: String::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feeds one socket read. Returns `true` once the blank line terminating
+    /// the head has been consumed.
+    fn feed(&mut self, chunk: &[u8]) -> Result<bool> {
+        for &byte in chunk {
+            if self.pending.len() >= MAX_HEADER_BYTES {
+                return Err(anyhow!("Request headers too large"));
+            }
+            self.pending.push(byte);
+            if byte != b'\n' {
+                continue;
+            }
+            let line = std::mem::take(&mut self.pending);
+            self.block.push_str(&String::from_utf8_lossy(&line));
+            if self.block.len() > MAX_HEADER_BYTES {
+                return Err(anyhow!("Request headers too large"));
+            }
+            if line == b"\r\n" || line == b"\n" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The head collected so far, including a last line left unterminated by
+    /// EOF (single-line requests are valid enough to classify).
+    fn finish(mut self) -> String {
+        if !self.pending.is_empty() {
+            self.block.push_str(&String::from_utf8_lossy(&self.pending));
+        }
+        self.block
+    }
+}
+
+/// Writes to the client with a budget: a peer that stops reading must not pin
+/// a stream slot (or a connection task) forever.
+async fn write_bounded<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(data))
+        .await
+        .context("Timed out writing to client")??;
+    Ok(())
+}
+
+/// Flushes to the client with the same budget.
+async fn flush_bounded<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(WRITE_TIMEOUT, writer.flush())
+        .await
+        .context("Timed out flushing to client")??;
+    Ok(())
+}
+
 /// Handles a single HTTP request to the proxy.
 ///
 /// Lock order (never inverted anywhere): `current_track`, then
 /// `current_source`. Neither is ever held across network I/O.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: tokio::net::TcpStream,
     current_track: Arc<Mutex<Option<String>>>,
@@ -440,38 +622,34 @@ async fn handle_client(
     shutdown: Arc<Notify>,
     client: reqwest::Client,
     semaphore: Arc<tokio::sync::Semaphore>,
+    admin_token: Arc<String>,
 ) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 
-    // Read the request head (request line + headers). Two budgets: 5s per line
-    // so a stalled sender is cut, plus 10s total so thousands of tiny lines
-    // within the 8K cap can't hold a slot nearly forever. Loop until the blank
-    // line: a request may arrive split over several TCP segments, and a single
-    // read() would truncate Origin/Host.
+    // Read the request head (request line + headers). Two budgets: 5s per read
+    // so a stalled sender is cut, plus 10s total so thousands of tiny reads
+    // within the 8K cap can't hold a slot nearly forever. Fixed-size reads:
+    // the cap is enforced by `HeadReader` as bytes arrive, not after a whole
+    // line has been buffered.
     let header_block = match tokio::time::timeout(HEADER_TOTAL_TIMEOUT, async {
-        let mut header_block = String::new();
-        let mut line = String::new();
+        let mut head = HeadReader::new();
+        let mut buf = [0u8; 1024];
         loop {
-            line.clear();
-            let n = tokio::time::timeout(READ_TIMEOUT, reader.read_line(&mut line))
+            let n = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut buf))
                 .await
                 .context("Timed out waiting for HTTP request")?
                 .context("Failed to read HTTP request")?;
             if n == 0 {
                 break;
             }
-            if line == "\r\n" || line == "\n" {
+            if head.feed(&buf[..n])? {
                 break;
             }
-            header_block.push_str(&line);
-            if header_block.len() > 8192 {
-                return Err(anyhow!("Request headers too large"));
-            }
         }
-        Ok::<_, anyhow::Error>(header_block)
+        Ok::<_, anyhow::Error>(head.finish())
     })
     .await
     {
@@ -607,6 +785,12 @@ async fn handle_client(
                 return Err(anyhow!("Forbidden origin for /update/apply"));
             }
         }
+        // Single-flight: concurrent callers shared one fixed staging path, so
+        // one download could truncate or delete another's staged binary.
+        let Ok(_update_guard) = UPDATE_INFLIGHT.try_lock() else {
+            write_update_busy(&mut write_half, origin.as_deref()).await?;
+            return Err(anyhow!("Update already in progress"));
+        };
         let (version, error_hint): (String, Option<String>) =
             match crate::updater::check_update(&client).await {
                 Ok(Some(info)) => {
@@ -633,15 +817,19 @@ async fn handle_client(
             serde_json::json!({"status": "updating", "version": version}).to_string()
         };
         let resp = json_response("HTTP/1.1 200 OK", &body, origin.as_deref());
-        write_half.write_all(&resp).await?;
-        write_half.flush().await?;
+        write_bounded(&mut write_half, &resp).await?;
+        flush_bounded(&mut write_half).await?;
         if !version.is_empty() {
-            // Answer went out: die so the swap helper can replace us, then
-            // relaunch `apply` with the new binary.
+            // Answer went out: stage the swap helper, then die so it can
+            // replace us and relaunch `apply` with the new binary. The latch
+            // guarantees the accept loop wakes even if the spawn failed.
             let exe = std::env::current_exe().context("Cannot find kebabify.exe path")?;
-            shutting_down.store(true, Ordering::Release);
             crate::updater::stage_and_relaunch(&exe, &crate::updater::staged_path(&exe))?;
-            shutdown.notify_waiters();
+            ShutdownLatch {
+                flag: shutting_down.clone(),
+                notify: shutdown.clone(),
+            }
+            .trip();
         }
         return Ok(());
     }
@@ -662,25 +850,28 @@ async fn handle_client(
             }
         }
         // Plus the per-boot token (an Origin header is forgeable by any local
-        // process). Installs predating the token file fall back to Origin-only.
-        if let Some(expected) = crate::shutdown_token::load() {
-            let ok = shutdown_token
-                .as_deref()
-                .is_some_and(|t| crate::shutdown_token::verify(t, &expected));
-            if !ok {
-                write_forbidden(&mut write_half).await?;
-                return Err(anyhow!("Refusing shutdown without a valid token"));
-            }
+        // process). Compared against the copy minted at startup: deleting the
+        // file on disk must not turn this check into a no-op.
+        let token_ok = shutdown_token
+            .as_deref()
+            .is_some_and(|t| crate::shutdown_token::verify(t, admin_token.as_str()));
+        if !token_ok {
+            write_forbidden(&mut write_half).await?;
+            return Err(anyhow!("Refusing shutdown without a valid token"));
         }
 
-        // Set the latched flag BEFORE waking the accept loop: even if the
-        // notifier is missed, the loop-top check breaks on the next iteration.
-        shutting_down.store(true, Ordering::Release);
+        // Latch before writing: even if the response write fails, the Drop
+        // impl still wakes the accept loop instead of leaving the proxy bound
+        // and apparently alive.
+        let latch = ShutdownLatch {
+            flag: shutting_down.clone(),
+            notify: shutdown.clone(),
+        };
+        latch.trip();
         let body = serde_json::json!({"status": "stopping"}).to_string();
         let resp = json_response("HTTP/1.1 200 OK", &body, None);
-        write_half.write_all(&resp).await?;
-        write_half.flush().await?;
-        shutdown.notify_waiters();
+        write_bounded(&mut write_half, &resp).await?;
+        flush_bounded(&mut write_half).await?;
         return Ok(());
     }
 
@@ -771,66 +962,52 @@ async fn handle_client(
                     .await
                     .context("resolve pool shut down")?;
                 *stage_inner.lock().await = "soulseek";
-                match crate::soulseek::open_file(&client, &tid).await {
-                    Ok(f) => Ok((
-                        Upstream::File {
-                            path: f.path,
-                            len: f.len,
-                        },
-                        "soulseek",
-                    )),
-                    Err(slsk_err) => {
-                        eprintln!(
-                            "[kebabify] Soulseek failed for track {}: {:#} — trying lucida",
-                            tid, slsk_err
-                        );
-                        *stage_inner.lock().await = "lucida";
-                        match crate::lucida::open_stream(
-                            &client,
-                            &spotify_url,
-                            range_header.as_deref(),
-                            if_range_header.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(s) => Ok((
-                                Upstream::Http {
-                                    resp: s.into_response(),
-                                    is_flac: true,
-                                },
-                                "lucida",
-                            )),
-                            Err(lucida_err) => {
-                                eprintln!(
-                                    "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
-                                    tid, lucida_err
-                                );
-                                *stage_inner.lock().await = "saavn";
-                                match crate::saavn::open_stream(
-                                    &client,
-                                    &tid,
-                                    range_header.as_deref(),
-                                    if_range_header.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok(s) => Ok((
-                                        Upstream::Http {
-                                            resp: s.into_response(),
-                                            is_flac: false,
-                                        },
-                                        "saavn",
-                                    )),
-                                    Err(saavn_err) => Err(anyhow!(
-                                        "soulseek: {:#}; lucida: {:#}; saavn: {:#}",
-                                        slsk_err,
-                                        lucida_err,
-                                        saavn_err
-                                    )),
-                                }
-                            }
-                        }
+                // Per-source deadline: a P2P download that has not produced a
+                // file in 25s must not eat the whole 60s budget and leave the
+                // player with no fallback at all.
+                let soulseek = tokio::time::timeout(
+                    crate::soulseek::OPEN_FILE_TIMEOUT,
+                    crate::soulseek::open_file(&client, &tid),
+                )
+                .await;
+                let slsk_err: Option<String> = match soulseek {
+                    Ok(Ok(f)) => {
+                        return Ok((
+                            Upstream::File {
+                                path: f.path,
+                                len: f.len,
+                            },
+                            "soulseek",
+                        ));
                     }
+                    Ok(Err(e)) => Some(format!("{:#}", e)),
+                    Err(_) => Some(format!(
+                        "timed out after {}s",
+                        crate::soulseek::OPEN_FILE_TIMEOUT.as_secs()
+                    )),
+                };
+                if let Some(detail) = &slsk_err {
+                    eprintln!(
+                        "[kebabify] Soulseek failed for track {}: {} — trying lucida",
+                        tid, detail
+                    );
+                }
+                match resolve_fallbacks(
+                    &client,
+                    &tid,
+                    &spotify_url,
+                    range_header.as_deref(),
+                    if_range_header.as_deref(),
+                    &stage_inner,
+                )
+                .await
+                {
+                    Ok(found) => Ok(found),
+                    Err(fallback_err) => Err(anyhow!(
+                        "soulseek: {}; {}",
+                        slsk_err.unwrap_or_else(|| "unknown".to_string()),
+                        fallback_err
+                    )),
                 }
             })
             .await
@@ -909,32 +1086,49 @@ async fn handle_client(
         response_header.push_str("\r\n\r\n");
 
         response_started = true;
-        write_half
-            .write_all(response_header.as_bytes())
+        write_bounded(&mut write_half, response_header.as_bytes())
             .await
             .map_err(|e| anyhow!("Failed to write response headers: {}", e))?;
 
-        write_half
-            .flush()
+        flush_bounded(&mut write_half)
             .await
             .map_err(|e| anyhow!("Failed to flush headers: {}", e))?;
 
         // HEAD can never reach this point: the method gate above rejects
         // everything but GET (and POST /update/apply), so there is no
         // headers-only branch to maintain here.
-        // Stream the body. The idle timeout bounds a stalled upstream:
-        // healthy streams chunk continuously, so 60s without a byte
-        // means dead — cut it instead of holding the slot forever.
+        // Stream the body. Three independent bounds: an idle timeout (no byte
+        // for 60s), a total duration (a track is minutes, not hours), and a
+        // byte ceiling (an upstream trickling one byte per minute must not
+        // hold the slot forever). Healthy streams trip none of them.
         let mut total_bytes: u64 = 0;
-        while let Some(chunk) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, audio_resp.chunk())
+        let relay = async {
+            while let Some(chunk) =
+                tokio::time::timeout(STREAM_IDLE_TIMEOUT, audio_resp.chunk())
+                    .await
+                    .context("Upstream stalled mid-stream")??
+            {
+                total_bytes += chunk.len() as u64;
+                if total_bytes > MAX_STREAM_BYTES {
+                    return Err(anyhow!(
+                        "Upstream body exceeds {} byte cap",
+                        MAX_STREAM_BYTES
+                    ));
+                }
+                write_bounded(&mut write_half, &chunk).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(MAX_STREAM_DURATION, relay)
             .await
-            .context("Upstream stalled mid-stream")??
-        {
-            write_half.write_all(&chunk).await?;
-            total_bytes += chunk.len() as u64;
-        }
+            .map_err(|_| {
+                anyhow!(
+                    "Upstream stream exceeded {}s duration cap",
+                    MAX_STREAM_DURATION.as_secs()
+                )
+            })??;
 
-        write_half.flush().await?;
+        flush_bounded(&mut write_half).await?;
         eprintln!(
             "[kebabify] Served {} for track {} ({} bytes)",
             if is_flac {
@@ -1015,6 +1209,62 @@ fn json_response(status_line: &str, body: &str, origin: Option<&str>) -> Vec<u8>
         body
     )
     .into_bytes()
+}
+
+/// Second and third choices after Soulseek: lucida FLAC, then Saavn 320kbps.
+/// Isolated so a Soulseek failure and a Soulseek timeout share one fallback
+/// path instead of two copies of the same chain.
+async fn resolve_fallbacks(
+    client: &reqwest::Client,
+    tid: &str,
+    spotify_url: &str,
+    range: Option<&str>,
+    if_range: Option<&str>,
+    stage: &Mutex<&'static str>,
+) -> Result<(Upstream, &'static str)> {
+    *stage.lock().await = "lucida";
+    match crate::lucida::open_stream(client, spotify_url, range, if_range).await {
+        Ok(s) => Ok((
+            Upstream::Http {
+                resp: s.into_response(),
+                is_flac: true,
+            },
+            "lucida",
+        )),
+        Err(lucida_err) => {
+            eprintln!(
+                "[kebabify] lucida failed for track {}: {:#} — trying Saavn fallback",
+                tid, lucida_err
+            );
+            *stage.lock().await = "saavn";
+            match crate::saavn::open_stream(client, tid, range, if_range).await {
+                Ok(s) => Ok((
+                    Upstream::Http {
+                        resp: s.into_response(),
+                        is_flac: false,
+                    },
+                    "saavn",
+                )),
+                Err(saavn_err) => Err(anyhow!("lucida: {:#}; saavn: {:#}", lucida_err, saavn_err)),
+            }
+        }
+    }
+}
+
+/// Writes a `409 Conflict` JSON response when an update is already running:
+/// the second caller must not start a competing download on the same path.
+async fn write_update_busy<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    origin: Option<&str>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let body =
+        serde_json::json!({"status": "error", "hint": "update already in progress"}).to_string();
+    writer
+        .write_all(&json_response("HTTP/1.1 409 Conflict", &body, origin))
+        .await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Writes a `502 Bad Gateway` JSON response when the self-update flow fails
@@ -1472,6 +1722,95 @@ mod tests {
         assert!(text.contains("Retry-After: 2\r\n"));
         assert!(text.contains("Access-Control-Allow-Origin: *\r\n"));
         assert!(text.contains("X-Content-Type-Options: nosniff\r\n"));
+    }
+
+    #[test]
+    fn head_reader_splits_and_stops_at_blank_line() {
+        let mut head = HeadReader::new();
+        assert!(!head.feed(b"GET /health HTTP/1.1\r\n").unwrap());
+        assert!(!head.feed(b"Origin: http://127.0.0.1:18900\r\n").unwrap());
+        assert!(head.feed(b"\r\n").unwrap());
+        let block = head.finish();
+        assert!(block.starts_with("GET /health HTTP/1.1\r\n"));
+        assert!(block.contains("Origin: http://127.0.0.1:18900"));
+    }
+
+    /// A request split over several reads must be reassembled, and a head
+    /// ending at EOF without a blank line must still classify.
+    #[test]
+    fn head_reader_handles_split_and_eof() {
+        let mut head = HeadReader::new();
+        for byte in b"GET / HTTP/1.1\r\n" {
+            assert!(!head.feed(&[*byte]).unwrap());
+        }
+        let block = head.finish();
+        assert_eq!(block, "GET / HTTP/1.1\r\n");
+    }
+
+    /// The cap must bite DURING the read: an unterminated line far larger than
+    /// the cap is rejected without ever being accumulated in full.
+    #[test]
+    fn head_reader_rejects_oversize_line_while_reading() {
+        let mut head = HeadReader::new();
+        let mut rejected = false;
+        for _ in 0..64 {
+            match head.feed(&vec![b'A'; 1024]) {
+                Ok(done) => assert!(!done),
+                Err(_) => {
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected, "an endless header line must be refused");
+        assert!(head.pending.len() <= MAX_HEADER_BYTES);
+    }
+
+    #[test]
+    fn head_reader_accepts_head_just_under_cap() {
+        let mut head = HeadReader::new();
+        let padding = MAX_HEADER_BYTES - 20;
+        let line = format!("X-Pad: {}\r\n", "a".repeat(padding));
+        assert!(!head.feed(line.as_bytes()).unwrap());
+        assert!(head.feed(b"\r\n").unwrap());
+        assert!(head.finish().len() <= MAX_HEADER_BYTES);
+    }
+
+    #[tokio::test]
+    async fn shutdown_latch_wakes_the_loop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        {
+            let latch = ShutdownLatch {
+                flag: flag.clone(),
+                notify: notify.clone(),
+            };
+            latch.trip();
+        }
+        assert!(flag.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_millis(500), notified)
+            .await
+            .expect("accept loop must be woken");
+    }
+
+    /// A latch dropped without an explicit trip (a failed response write on the
+    /// way out) must still wake the loop instead of leaving the proxy bound.
+    #[tokio::test]
+    async fn shutdown_latch_notifies_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        drop(ShutdownLatch {
+            flag: flag.clone(),
+            notify: notify.clone(),
+        });
+        assert!(flag.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_millis(500), notified)
+            .await
+            .expect("a dropped latch must wake the loop");
     }
 
     #[test]

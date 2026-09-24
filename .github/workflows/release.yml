@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Reject tags not on the default branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          tagged_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          if ! compare_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tagged_commit}...${default_branch}" --jq '.status')"; then
+            echo "::error::Could not verify whether tag ${GITHUB_REF_NAME} is an ancestor of the default branch ${default_branch}."
+            exit 1
+          fi
+          if [[ "$compare_status" != "ahead" && "$compare_status" != "identical" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points to ${tagged_commit}, which is not an ancestor of the default branch ${default_branch}."
+            exit 1
+          fi
+          echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "RELEASE_COMMIT=${tagged_commit}" >> "$GITHUB_ENV"
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.85.0 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.85.0
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test --locked
+      - name: Run tests without default features
+        run: cargo test --no-default-features --locked
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Stage release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp target/release/kebabify.exe kebabify.exe
+          release_sha256="$(sha256sum kebabify.exe | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+          printf '%s  kebabify.exe\n' "$release_sha256" > kebabify.exe.sha256
+          echo "RELEASE_SHA256=${release_sha256}" >> "$GITHUB_ENV"
+      - name: Verify checksum sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          fresh_sha256="$(sha256sum kebabify.exe | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+          sidecar_line="$(<kebabify.exe.sha256)"
+          expected_line="${fresh_sha256}  kebabify.exe"
+          if [[ "$sidecar_line" != "$expected_line" ]]; then
+            echo "::error::Checksum sidecar does not match kebabify.exe"
+            exit 1
+          fi
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          # kebabify ${RELEASE_VERSION}
+          ## Changes
+          - Published the tagged Windows release.
+          ## Assets
+          - \`kebabify.exe\` — SHA-256: \`${RELEASE_SHA256}\`
+          - \`kebabify.exe.sha256\` — contents: \`${RELEASE_SHA256}  kebabify.exe\`
+          - Tagged commit: \`${RELEASE_COMMIT}\`
+          EOF
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" kebabify.exe kebabify.exe.sha256 --verify-tag --title "kebabify ${GITHUB_REF_NAME}" --notes-file release-notes.md

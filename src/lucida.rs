@@ -116,7 +116,15 @@ const MAX_COOKIES_READ: usize = 16 * 1024;
 /// Reads at most [`MAX_COOKIES_READ`] bytes as text, stopping at a character
 /// boundary (never panics on a split UTF-8 sequence).
 fn read_head(path: &std::path::Path, max: usize) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    use std::io::Read;
+    // Bounded read: `fs::read` would allocate the whole file before the
+    // truncation, so the cap it claims to enforce was not enforced at all.
+    let mut bytes = Vec::with_capacity(max.min(64 * 1024));
+    std::fs::File::open(path)
+        .ok()?
+        .take(max as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
     let len = bytes.len().min(max);
     match std::str::from_utf8(&bytes[..len]) {
         Ok(s) => Some(s.to_string()),

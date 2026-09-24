@@ -37,10 +37,21 @@ pub struct SoulseekFile {
 /// live run took ~1-2 min. Past this the player has long given up — fail over
 /// to lucida/saavn instead of holding the connection forever.
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(480);
+pub(crate) const OPEN_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Minimum plausible size for a FLAC track. Anything smaller is a stub,
 /// an error page, or a mislabeled stub — delete, don't serve.
 const MIN_FLAC_BYTES: u64 = 512 * 1024;
+pub(crate) const MAX_FLAC_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const CACHE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+struct StagingDir(PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 /// One Soulseek session at a time: concurrent logins on the same account
 /// kick each other off the network.
@@ -116,7 +127,11 @@ async fn open_file_with(
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
     }
-    std::fs::create_dir_all(&staging).context("Soulseek: cannot create staging dir")?;
+    if let Err(error) = std::fs::create_dir_all(&staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error).context("Soulseek: cannot create staging dir");
+    }
+    let _staging_guard = StagingDir(staging.clone());
 
     let args = build_args(&user, &pass, &query, &staging);
     eprintln!(
@@ -124,7 +139,6 @@ async fn open_file_with(
         query
     );
     if let Err(e) = run_sockseek(&binary, &staging, &args).await {
-        let _ = std::fs::remove_dir_all(&staging);
         return Err(e.context(format!("Soulseek: download failed for \"{}\"", query)));
     }
 
@@ -134,14 +148,36 @@ async fn open_file_with(
         let _ = std::fs::remove_file(&cached);
     }
     std::fs::rename(&downloaded, &cached).context("Soulseek: cannot publish to cache")?;
-    let _ = std::fs::remove_dir_all(&staging);
     let len = validate_flac(&cached).context("Soulseek: downloaded file failed validation")?;
+    evict_cache(&dir, &cached);
     eprintln!(
         "[kebabify] Soulseek: cached {} ({} bytes)",
         cached.display(),
         len
     );
     Ok(SoulseekFile { path: cached, len })
+}
+
+fn append_stderr_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    let excess = tail.len().saturating_sub(400);
+    if excess > 0 {
+        tail.drain(..excess);
+    }
+}
+
+async fn drain_child_stderr(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
+    let mut tail = Vec::with_capacity(400);
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut stderr, &mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => append_stderr_tail(&mut tail, &chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    tail
 }
 
 /// Runs the downloader with a hard timeout. On timeout the child is killed:
@@ -152,42 +188,44 @@ async fn open_file_with(
 /// sit in an unwritable CWD) and piped stdio: on failure the stderr tail
 /// goes into the error so `proxy.log` says WHY, not just "exit code 1".
 async fn run_sockseek(binary: &Path, staging: &Path, args: &[String]) -> Result<()> {
-    let child = tokio::process::Command::new(binary)
+    let mut child = tokio::process::Command::new(binary)
         .args(args)
         .current_dir(staging)
         // The child inherits nothing sensitive: creds travel as args (it
         // needs them there).
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("Soulseek: cannot launch downloader binary")?;
-    let output = match tokio::time::timeout(DOWNLOAD_TIMEOUT, child.wait_with_output()).await {
-        Ok(out) => out.context("Soulseek: downloader wait failed")?,
-        // On expiry the timed-out future is dropped, and kill_on_drop(true)
-        // above kills the child with it — no orphaned P2P client.
+    let stderr = child
+        .stderr
+        .take()
+        .context("Soulseek: downloader stderr unavailable")?;
+    let runtime = tokio::runtime::Handle::current();
+    let stderr_thread = std::thread::spawn(move || runtime.block_on(drain_child_stderr(stderr)));
+    let status = match tokio::time::timeout(DOWNLOAD_TIMEOUT, child.wait()).await {
+        Ok(result) => result,
         Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stderr_thread.join();
             return Err(anyhow!(
                 "Soulseek: download timed out after {}s — falling through",
                 DOWNLOAD_TIMEOUT.as_secs()
             ));
         }
     };
-    if output.status.success() {
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let status = status.context("Soulseek: downloader wait failed")?;
+    if status.success() {
         return Ok(());
     }
-    let stderr_tail: String = String::from_utf8_lossy(&output.stderr)
-        .chars()
-        .rev()
-        .take(400)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let stderr_tail = String::from_utf8_lossy(&stderr);
     Err(anyhow!(
         "Soulseek: downloader exited with status {} for this track (stderr tail: {})",
-        output.status,
+        status,
         stderr_tail.trim()
     ))
 }
@@ -227,31 +265,65 @@ fn search_query(artist: &str, title: &str) -> String {
         .to_string()
 }
 
+const MAX_FLAC_DEPTH: usize = 32;
+const MAX_FLAC_ENTRIES: usize = 100_000;
+
 /// Largest `.flac` under `dir` (recursive). The downloader names files its
 /// own way; size is the only robust selector. Pure-ish for tests (takes any
 /// dir).
 fn pick_flac(dir: &Path) -> Option<PathBuf> {
-    fn visit(dir: &Path, best: &mut Option<(u64, PathBuf)>) {
+    pick_flac_with_limits(dir, MAX_FLAC_DEPTH, MAX_FLAC_ENTRIES)
+}
+
+fn pick_flac_with_limits(dir: &Path, max_depth: usize, max_entries: usize) -> Option<PathBuf> {
+    let mut best: Option<(u64, PathBuf)> = None;
+    let mut pending = vec![(dir.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = pending.pop() {
         let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
+            Ok(entries) => entries,
+            Err(_) => continue,
         };
         for entry in entries.flatten() {
+            if visited >= max_entries {
+                return best.map(|(_, path)| path);
+            }
+            visited += 1;
             let path = entry.path();
-            if path.is_dir() {
-                visit(&path, best);
-            } else if path.extension().is_some_and(|e| e == "flac") {
-                if let Ok(m) = std::fs::metadata(&path) {
-                    if best.as_ref().is_none_or(|(size, _)| m.len() > *size) {
-                        *best = Some((m.len(), path));
-                    }
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if is_link_or_reparse_point(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                if depth < max_depth {
+                    pending.push((path, depth + 1));
                 }
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "flac")
+                && best.as_ref().is_none_or(|(size, _)| metadata.len() > *size)
+            {
+                best = Some((metadata.len(), path));
             }
         }
     }
-    let mut best = None;
-    visit(dir, &mut best);
     best.map(|(_, path)| path)
+}
+
+fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Validates a cached/downloaded file: `fLaC` magic + size floor. Returns the
@@ -265,6 +337,14 @@ fn validate_flac(path: &Path) -> Result<u64> {
             meta.len()
         ));
     }
+    if meta.len() > MAX_FLAC_BYTES {
+        let _ = std::fs::remove_file(path);
+        return Err(anyhow!(
+            "Soulseek: file too large to be FLAC ({} bytes, max {})",
+            meta.len(),
+            MAX_FLAC_BYTES
+        ));
+    }
     let mut header = [0u8; 4];
     {
         use std::io::Read;
@@ -276,6 +356,48 @@ fn validate_flac(path: &Path) -> Result<u64> {
         return Err(anyhow!("Soulseek: bad magic — not a FLAC file"));
     }
     Ok(meta.len())
+}
+
+fn evict_cache(dir: &Path, keep: &Path) {
+    evict_cache_with_budget(dir, keep, CACHE_BUDGET_BYTES);
+}
+
+fn evict_cache_with_budget(dir: &Path, keep: &Path, budget: u64) {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let len = metadata.len();
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        total = total.saturating_add(len);
+        if path != keep {
+            files.push((path, len, modified));
+        }
+    }
+    if total <= budget {
+        return;
+    }
+    files.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+    for (path, len, _) in files {
+        if total <= budget {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 /// Locates the downloader binary: our own bin dir first (where `apply` can
@@ -475,6 +597,111 @@ mod tests {
         assert_eq!(pick_flac(&dir).unwrap(), sub.join("big.flac"));
         assert!(pick_flac(&dir.join("nothing-here")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stderr_drain_keeps_bounded_tail() {
+        let input = (0..4096)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut tail = Vec::new();
+        for chunk in input.chunks(1024) {
+            append_stderr_tail(&mut tail, chunk);
+        }
+        assert_eq!(tail, input[input.len() - 400..]);
+    }
+
+    #[test]
+    fn staging_guard_removes_directory() {
+        let dir = temp_flac_dir("staging-guard");
+        let staging = dir.join(".staging-test");
+        std::fs::create_dir_all(&staging).unwrap();
+        {
+            let _guard = StagingDir(staging.clone());
+        }
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flac_walk_stops_at_symlink_cycle_or_limits() {
+        let dir = temp_flac_dir("walk-limit");
+        let cycle = dir.join("cycle");
+        let cycle_created = {
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(&dir, &cycle).is_ok()
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&dir, &cycle).is_ok()
+            }
+            #[cfg(not(any(windows, unix)))]
+            {
+                false
+            }
+        };
+        if cycle_created {
+            assert!(pick_flac_with_limits(&dir, 3, 32).is_none());
+        }
+        let deep = dir.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("track.flac"), b"fLaC").unwrap();
+        assert!(pick_flac_with_limits(&dir, 0, MAX_FLAC_ENTRIES).is_none());
+        assert!(pick_flac_with_limits(&dir, MAX_FLAC_DEPTH, 0).is_none());
+        if cycle_created {
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&cycle);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&cycle);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_flac_is_rejected_and_removed() {
+        let dir = temp_flac_dir("oversized");
+        let path = dir.join("oversized.flac");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_FLAC_BYTES + 1).unwrap();
+        assert!(validate_flac(&path).is_err());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn set_modified(path: &Path, seconds: u64) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds));
+        file.set_times(times).unwrap();
+    }
+
+    #[test]
+    fn eviction_removes_oldest_entries_first() {
+        let dir = temp_flac_dir("eviction");
+        let keep = dir.join("published.flac");
+        let old = dir.join("old.flac");
+        let middle = dir.join("middle.flac");
+        let newest = dir.join("newest.flac");
+        std::fs::write(&keep, vec![0u8; 4]).unwrap();
+        std::fs::write(&old, vec![0u8; 6]).unwrap();
+        std::fs::write(&middle, vec![0u8; 6]).unwrap();
+        std::fs::write(&newest, vec![0u8; 6]).unwrap();
+        set_modified(&keep, 0);
+        set_modified(&old, 1);
+        set_modified(&middle, 2);
+        set_modified(&newest, 3);
+        evict_cache_with_budget(&dir, &keep, 10);
+        assert!(keep.exists());
+        assert!(!old.exists());
+        assert!(!middle.exists());
+        assert!(newest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_file_timeout_is_25_seconds() {
+        assert_eq!(OPEN_FILE_TIMEOUT, std::time::Duration::from_secs(25));
     }
 
     /// Credentials round-trip in one test: env vars are process-global, so
