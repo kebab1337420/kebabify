@@ -393,10 +393,10 @@ fn query_cookie_header(db: &Path) -> Result<Option<String>> {
 #[cfg_attr(not(feature = "firefox-import"), allow(dead_code))]
 fn firefox_user_agent(exe: &Path) -> Result<String> {
     let dir = exe.parent().context("Browser path has no parent dir")?;
-    if let Ok(platform) = std::fs::read_to_string(dir.join("platform.ini")) {
-        if let Some(ua) = gecko_ua_from_platform_ini(&platform) {
-            return Ok(ua);
-        }
+    if let Ok(platform) = std::fs::read_to_string(dir.join("platform.ini"))
+        && let Some(ua) = gecko_ua_from_platform_ini(&platform)
+    {
+        return Ok(ua);
     }
     let ini = std::fs::read_to_string(dir.join("application.ini"))
         .context("Failed to read application.ini next to the browser")?;
@@ -413,19 +413,17 @@ fn gecko_ua_from_platform_ini(ini: &str) -> Option<String> {
             in_build = t.eq_ignore_ascii_case("[Build]");
             continue;
         }
-        if in_build {
-            if let Some(v) = t.strip_prefix("Milestone=").map(str::trim) {
-                let digits: String = v
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '.')
-                    .collect();
-                let v = digits.trim_matches('.');
-                if !v.is_empty() {
-                    return Some(format!(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{}) Gecko/20100101 Firefox/{}",
-                        v, v
-                    ));
-                }
+        if in_build && let Some(v) = t.strip_prefix("Milestone=").map(str::trim) {
+            let digits: String = v
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let v = digits.trim_matches('.');
+            if !v.is_empty() {
+                return Some(format!(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{}) Gecko/20100101 Firefox/{}",
+                    v, v
+                ));
             }
         }
     }
@@ -440,15 +438,14 @@ fn firefox_ua_from_ini(ini: &str) -> Option<String> {
             in_app = t.eq_ignore_ascii_case("[App]");
             continue;
         }
-        if in_app {
-            if let Some(v) = t.strip_prefix("Version=").map(str::trim) {
-                if !v.is_empty() {
-                    return Some(format!(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{}) Gecko/20100101 Firefox/{}",
-                        v, v
-                    ));
-                }
-            }
+        if in_app
+            && let Some(v) = t.strip_prefix("Version=").map(str::trim)
+            && !v.is_empty()
+        {
+            return Some(format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{}) Gecko/20100101 Firefox/{}",
+                v, v
+            ));
         }
     }
     None
@@ -500,10 +497,9 @@ fn response_cookies(resp: &Value) -> Result<Vec<(String, String)>> {
         if let (Some(name), Some(value)) = (
             c.get("name").and_then(Value::as_str),
             c.get("value").and_then(Value::as_str),
-        ) {
-            if name == "cf_clearance" || name == "__cf_bm" || name == "__cfruid" {
-                out.push((name.to_string(), value.to_string()));
-            }
+        ) && (name == "cf_clearance" || name == "__cf_bm" || name == "__cfruid")
+        {
+            out.push((name.to_string(), value.to_string()));
         }
     }
     Ok(out)
@@ -534,27 +530,23 @@ async fn wait_for_page(port: u16) -> Option<String> {
             .timeout(Duration::from_secs(2))
             .send()
             .await
+            && let Ok(targets) = resp.json::<Value>().await
+            && let Some(list) = targets.as_array()
         {
-            if let Ok(targets) = resp.json::<Value>().await {
-                if let Some(list) = targets.as_array() {
-                    // Two passes: an exact lucida.to tab first, a blank/new tab
-                    // only as fallback. Grabbing the blank tab when the lucida
-                    // tab exists would still work (cookies are filtered by URL,
-                    // UA is browser-wide), but the exact tab is unambiguous.
-                    for pass_exact in [true, false] {
-                        for t in list {
-                            let is_page = t.get("type").and_then(Value::as_str) == Some("page");
-                            let url = t.get("url").and_then(Value::as_str).unwrap_or("");
-                            let matches =
-                                url.contains("lucida.to") || (!pass_exact && url.is_empty());
-                            if is_page && matches {
-                                if let Some(ws) =
-                                    t.get("webSocketDebuggerUrl").and_then(Value::as_str)
-                                {
-                                    return Some(ws.to_string());
-                                }
-                            }
-                        }
+            // Two passes: an exact lucida.to tab first, a blank/new tab
+            // only as fallback. Grabbing the blank tab when the lucida
+            // tab exists would still work (cookies are filtered by URL,
+            // UA is browser-wide), but the exact tab is unambiguous.
+            for pass_exact in [true, false] {
+                for t in list {
+                    let is_page = t.get("type").and_then(Value::as_str) == Some("page");
+                    let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+                    let matches = url.contains("lucida.to") || (!pass_exact && url.is_empty());
+                    if is_page
+                        && matches
+                        && let Some(ws) = t.get("webSocketDebuggerUrl").and_then(Value::as_str)
+                    {
+                        return Some(ws.to_string());
                     }
                 }
             }
@@ -732,20 +724,18 @@ fn default_browser() -> Option<FoundBrowser> {
     let mut candidate = prog_id.as_str();
     loop {
         let key = format!(r"{}\shell\open\command", candidate);
-        if let Ok(cmd_key) = classes.open_subkey_with_flags(&key, KEY_READ) {
-            if let Ok(cmd) = cmd_key.get_value::<String, _>("") {
-                if let Some(exe) = parse_exe_from_command(&cmd) {
-                    if exe.exists() {
-                        // Unknown default (not a Chromium/Firefox family we
-                        // know the flags for): decline and let the install
-                        // scan pick a browser we can actually drive.
-                        if let Some(kind) = classify_exe_opt(&exe) {
-                            return Some(FoundBrowser { kind, exe });
-                        }
-                        return None;
-                    }
-                }
+        if let Ok(cmd_key) = classes.open_subkey_with_flags(&key, KEY_READ)
+            && let Ok(cmd) = cmd_key.get_value::<String, _>("")
+            && let Some(exe) = parse_exe_from_command(&cmd)
+            && exe.exists()
+        {
+            // Unknown default (not a Chromium/Firefox family we
+            // know the flags for): decline and let the install
+            // scan pick a browser we can actually drive.
+            if let Some(kind) = classify_exe_opt(&exe) {
+                return Some(FoundBrowser { kind, exe });
             }
+            return None;
         }
         let i = candidate.rfind('.')?;
         candidate = &candidate[..i];

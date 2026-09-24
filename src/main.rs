@@ -144,10 +144,10 @@ fn proxy_stdio() -> (Stdio, Stdio) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("proxy.log");
     // Cheap rotation: start fresh past 2 MB.
-    if let Ok(m) = std::fs::metadata(&path) {
-        if m.len() > 2 * 1024 * 1024 {
-            let _ = std::fs::remove_file(&path);
-        }
+    if let Ok(m) = std::fs::metadata(&path)
+        && m.len() > 2 * 1024 * 1024
+    {
+        let _ = std::fs::remove_file(&path);
     }
     match std::fs::OpenOptions::new()
         .create(true)
