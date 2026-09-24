@@ -19,6 +19,11 @@ const ASSET_NAME: &str = "kebabify.exe";
 /// Checksum sidecar asset name (`"<hex>  kebabify.exe"`).
 const SHA_ASSET_NAME: &str = "kebabify.exe.sha256";
 
+/// Ceiling on a release asset. The real binary is a few MB; a request
+/// timeout bounds time, never bytes, so an endless body would otherwise fill
+/// the disk before any error surfaces.
+const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Hosts a release download may come from (TLS protects the rest; this pins
 /// the trust root so a poisoned JSON payload can't point us anywhere else).
 /// `github.com` URLs are additionally path-pinned to our repo's download
@@ -29,6 +34,11 @@ fn pinned_url(raw: &str) -> Result<url::Url> {
     let url = url::Url::parse(raw).context("Bad release URL")?;
     if url.scheme() != "https" {
         return Err(anyhow!("Release URL is not https"));
+    }
+    // Default port only: an explicit port is either a downgrade attempt or a
+    // service we never asked for.
+    if url.port_or_known_default() != Some(443) {
+        return Err(anyhow!("Release URL port not allowed"));
     }
     match url.host_str() {
         Some("github.com") => {
@@ -52,7 +62,16 @@ fn pinned_url(raw: &str) -> Result<url::Url> {
 fn redirect_ok(original: &str, resp: &reqwest::Response) -> Result<()> {
     let before = url::Url::parse(original).context("Bad release URL")?;
     let after = resp.url();
-    if redirect_target_ok(&before, after) {
+    // Production path: the original URL was pin-eligible, so every hop must
+    // re-pass the full policy. The fallback only triggers for origins that
+    // could never be pinned (a loopback mock in tests): same origin, nothing
+    // looser.
+    let ok = if pinned_url(before.as_str()).is_ok() {
+        redirect_target_ok(&before, after)
+    } else {
+        after.scheme() == before.scheme() && after.host_str() == before.host_str()
+    };
+    if ok {
         Ok(())
     } else {
         Err(anyhow!(
@@ -62,9 +81,11 @@ fn redirect_ok(original: &str, resp: &reqwest::Response) -> Result<()> {
     }
 }
 
-/// Pure core of [`redirect_ok`], unit-testable without a response.
+/// Pure core of [`redirect_ok`], unit-testable without a response. Every hop
+/// must re-pass the full policy: accepting "same host as the original" would
+/// let a redirect leave the pinned download tree or downgrade to cleartext.
 fn redirect_target_ok(before: &url::Url, after: &url::Url) -> bool {
-    after.host_str() == before.host_str() || pinned_url(after.as_str()).is_ok()
+    before.scheme() == "https" && after.scheme() == "https" && pinned_url(after.as_str()).is_ok()
 }
 
 /// How long an update check stays cached (GitHub rate-limits anonymous API
@@ -158,7 +179,10 @@ fn find_release(json: &serde_json::Value, current: &str) -> Option<ReleaseInfo> 
 }
 
 /// Streams the release asset to `dest`, verified when the release publishes
-/// a checksum. A failed download never leaves a partial file behind.
+/// a checksum. A failed download never leaves a partial file behind: the
+/// bytes land in a unique `.part` file and are published onto `dest` only
+/// after the checksum matches, so a second writer can never truncate or
+/// delete a staged binary that is being verified.
 pub async fn download_release(
     client: &reqwest::Client,
     info: &ReleaseInfo,
@@ -171,10 +195,59 @@ pub async fn download_release(
     result
 }
 
+/// Sibling `.part` path unique to this process and attempt. Never a fixed
+/// name: a predictable staging file is a pre-creation target for another
+/// local process.
+fn part_path(dest: &std::path::Path) -> Option<std::path::PathBuf> {
+    let nonce = format!(
+        "{:x}{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()) | (d.as_secs() << 20))
+            .unwrap_or(0)
+    );
+    let mut name = dest.file_name()?.to_os_string();
+    name.push(format!(".{}.part", nonce));
+    Some(dest.with_file_name(name))
+}
+
 async fn download_inner(
     client: &reqwest::Client,
     info: &ReleaseInfo,
     dest: &std::path::Path,
+) -> Result<()> {
+    let part = part_path(dest).context("Cannot derive staging path for update")?;
+    // RAII: every early return below (transport error, cap, short file,
+    // checksum failure) drops the staging bytes. Only the verified rename
+    // publishes them.
+    let mut staged = Some(StagedPart(part.clone()));
+    let result = download_to_part(client, info, dest, &part).await;
+    match result {
+        Ok(()) => {
+            // Published: keep the file.
+            std::mem::forget(staged.take().expect("staging guard present"));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes its file unless forgotten, so no failure path can strand a
+/// half-downloaded or unverified binary on disk.
+struct StagedPart(std::path::PathBuf);
+
+impl Drop for StagedPart {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn download_to_part(
+    client: &reqwest::Client,
+    info: &ReleaseInfo,
+    dest: &std::path::Path,
+    part: &std::path::Path,
 ) -> Result<()> {
     let mut resp = client
         .get(&info.download_url)
@@ -188,20 +261,46 @@ async fn download_inner(
     resp = resp
         .error_for_status()
         .context("Update download returned an error")?;
+    if let Some(declared) = resp.content_length() {
+        if declared > MAX_UPDATE_BYTES {
+            return Err(anyhow!(
+                "Update asset declares {} bytes, above the {} byte cap",
+                declared,
+                MAX_UPDATE_BYTES
+            ));
+        }
+    }
     let mut file =
-        std::fs::File::create(dest).with_context(|| format!("Cannot write {}", dest.display()))?;
+        std::fs::File::create(part).with_context(|| format!("Cannot write {}", part.display()))?;
     use std::io::Write;
+    let mut written: u64 = 0;
     while let Some(chunk) = resp.chunk().await.context("Update download interrupted")? {
+        written += chunk.len() as u64;
+        if written > MAX_UPDATE_BYTES {
+            return Err(anyhow!(
+                "Update asset exceeds the {} byte cap",
+                MAX_UPDATE_BYTES
+            ));
+        }
         file.write_all(&chunk)
             .context("Failed to write update file")?;
     }
     file.flush().ok();
-    let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    drop(file);
+    let size = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
     if size < 1024 {
-        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(part);
         return Err(anyhow!("Downloaded update is suspiciously small"));
     }
-    verify_checksum(client, info, dest).await?;
+    verify_checksum(client, info, part).await?;
+    // Verified: publish onto the path the swap helper expects.
+    std::fs::rename(part, dest).with_context(|| {
+        format!(
+            "Cannot publish verified update {} -> {}",
+            part.display(),
+            dest.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -285,7 +384,17 @@ pub fn stage_and_relaunch(current_exe: &std::path::Path, staged: &std::path::Pat
             escape(current_exe),
             escape(current_exe)
         );
-        let mut cmd = std::process::Command::new("cmd.exe");
+        // The shell is invoked by absolute path: an unqualified `cmd.exe` is
+        // resolved through the current directory and PATH, so a planted
+        // cmd.exe would run with our privileges before the swap even starts.
+        let shell = std::env::var("SystemRoot")
+            .map(|root| {
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("cmd.exe")
+            })
+            .unwrap_or_else(|_| std::path::PathBuf::from("cmd.exe"));
+        let mut cmd = std::process::Command::new(shell);
         cmd.args(["/C", &script]);
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         cmd.stdout(std::process::Stdio::null())
@@ -387,8 +496,11 @@ mod tests {
             "https://github.com/kebab1337420/kebabify/releases/download/v0.6.0/kebabify.exe",
         )
         .unwrap();
-        // Same host after a (signed-URL) hop: fine.
-        let same = url::Url::parse("https://github.com/other/path/file.exe").unwrap();
+        // Same pinned tree: fine.
+        let same = url::Url::parse(
+            "https://github.com/kebab1337420/kebabify/releases/download/v0.7.0/kebabify.exe",
+        )
+        .unwrap();
         assert!(redirect_target_ok(&dl, &same));
         // Hop onto the CDN host: still pinned.
         let cdn = url::Url::parse("https://objects.githubusercontent.com/abc").unwrap();
@@ -396,6 +508,80 @@ mod tests {
         // Hop off-host entirely: rejected.
         let evil = url::Url::parse("https://evil.com/kebabify.exe").unwrap();
         assert!(!redirect_target_ok(&dl, &evil));
+    }
+
+    /// A same-host hop that leaves the pinned download tree is an escape, and
+    /// a cleartext hop is a downgrade: both must be refused even though the
+    /// host matches the original URL.
+    #[test]
+    fn redirect_cannot_escape_pinned_tree_or_downgrade() {
+        let dl = url::Url::parse(
+            "https://github.com/kebab1337420/kebabify/releases/download/v0.6.0/kebabify.exe",
+        )
+        .unwrap();
+        let off_tree =
+            url::Url::parse("https://github.com/attacker/evil/releases/download/v9/kebabify.exe")
+                .unwrap();
+        assert!(!redirect_target_ok(&dl, &off_tree));
+        let cleartext = url::Url::parse(
+            "http://github.com/kebab1337420/kebabify/releases/download/v0.7.0/kebabify.exe",
+        )
+        .unwrap();
+        assert!(!redirect_target_ok(&dl, &cleartext));
+        let odd_port = url::Url::parse(
+            "https://github.com:8443/kebab1337420/kebabify/releases/download/v0.7.0/kebabify.exe",
+        )
+        .unwrap();
+        assert!(!redirect_target_ok(&dl, &odd_port));
+        let evil_cdn = url::Url::parse("https://objects.githubusercontent.com.evil.com/x").unwrap();
+        assert!(!redirect_target_ok(&dl, &evil_cdn));
+    }
+
+    /// Staging must be unique per attempt: a fixed `.part` name is a
+    /// pre-creation target for another local process and collides between
+    /// concurrent downloads.
+    #[test]
+    fn staging_part_path_is_unique_and_sibling() {
+        let dest = std::path::Path::new("C:/tools/kebabify.exe.new");
+        let a = part_path(dest).unwrap();
+        let b = part_path(dest).unwrap();
+        assert_ne!(a, b, "staging path must differ between attempts");
+        assert_eq!(a.parent(), dest.parent());
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("kebabify.exe.new."));
+        assert!(name.ends_with(".part"));
+    }
+
+    /// A failed download must not leave either the destination or any staging
+    /// residue behind.
+    #[tokio::test]
+    async fn failed_download_leaves_no_staging_residue() {
+        let mock = MockServer::start(vec![Route::new("/file", vec![(200, vec![7u8; 4096])])]).await;
+        let client = reqwest::Client::new();
+        let dir = std::env::temp_dir().join(format!("kebabify_residue_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let info = ReleaseInfo {
+            version: "9.9.9".to_string(),
+            download_url: format!("{}/file", mock.base_url),
+            // Points at a valid-looking body whose hash cannot match, so the
+            // failure happens after the bytes are on disk.
+            sha_url: Some(format!("{}/file", mock.base_url)),
+        };
+        let dest = dir.join("kebabify.exe.new");
+        assert!(download_release(&client, &info, &dest).await.is_err());
+        assert!(!dest.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "unexpected leftovers: {:?}",
+            leftovers
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Fail-closed: a payload without a checksum sidecar refuses the binary

@@ -72,27 +72,42 @@ struct LruCache {
 }
 
 impl LruCache {
-    fn get(&mut self, key: &str, ttl: std::time::Duration) -> Option<String> {
-        let (url, at) = self.map.get(key)?;
-        if at.elapsed() >= ttl {
-            self.map.remove(key);
-            return None;
+    fn get(
+        &mut self,
+        key: &str,
+        ttl: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        let url = self.map.get(key).map(|(url, at)| {
+            if now.saturating_duration_since(*at) >= ttl {
+                None
+            } else {
+                Some(url.clone())
+            }
+        });
+        match url {
+            Some(Some(url)) => {
+                if let Some(pos) = self.order.iter().position(|k| k == key) {
+                    self.order.remove(pos);
+                }
+                self.order.push_back(key.to_string());
+                Some(url)
+            }
+            Some(None) => {
+                self.map.remove(key);
+                self.order.retain(|k| k != key);
+                None
+            }
+            None => None,
         }
-        let url = url.clone();
-        // Touch: move to the MRU back.
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(key.to_string());
-        Some(url)
     }
 
-    fn insert(&mut self, key: String, url: String) {
+    fn insert(&mut self, key: String, url: String, now: std::time::Instant) {
         if let Some(pos) = self.order.iter().position(|k| k == &key) {
             self.order.remove(pos);
         }
         self.order.push_back(key.clone());
-        self.map.insert(key, (url, std::time::Instant::now()));
+        self.map.insert(key, (url, now));
         while self.map.len() > CACHE_CAP {
             if let Some(oldest) = self.order.pop_front() {
                 self.map.remove(&oldest);
@@ -102,8 +117,9 @@ impl LruCache {
         }
     }
 
-    fn sweep_expired(&mut self, ttl: std::time::Duration) {
-        self.map.retain(|_, (_, at)| at.elapsed() < ttl);
+    fn sweep_expired(&mut self, ttl: std::time::Duration, now: std::time::Instant) {
+        self.map
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < ttl);
         let live: std::collections::HashSet<&str> = self.map.keys().map(String::as_str).collect();
         self.order.retain(|k| live.contains(k.as_str()));
     }
@@ -127,16 +143,52 @@ static NEG_CACHE: std::sync::LazyLock<std::sync::Mutex<LruCache>> =
         })
     });
 
+#[cfg(test)]
+static CACHE_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+#[cfg(test)]
+fn lock_cache_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    CACHE_TEST_LOCK.blocking_lock()
+}
+
+/// Async-aware variant: a std guard held across an await is a deadlock and a
+/// clippy error, and these tests do network work.
+#[cfg(test)]
+async fn lock_cache_for_test_async() -> tokio::sync::MutexGuard<'static, ()> {
+    CACHE_TEST_LOCK.lock().await
+}
+
+#[cfg(test)]
+fn reset_caches_for_tests() {
+    if let Ok(mut guard) = CDN_CACHE.lock() {
+        guard.map.clear();
+        guard.order.clear();
+    }
+    if let Ok(mut guard) = NEG_CACHE.lock() {
+        guard.map.clear();
+        guard.order.clear();
+    }
+}
+
 /// Cached CDN URL when fresh, else `None`. Stale entries are evicted on
 /// read so the map can't fill with dead weight over a long-running proxy.
 fn cached_cdn_url(track_id: &str) -> Option<String> {
-    CDN_CACHE.lock().ok()?.get(track_id, CACHE_TTL)
+    cached_cdn_url_at(track_id, std::time::Instant::now())
+}
+
+fn cached_cdn_url_at(track_id: &str, now: std::time::Instant) -> Option<String> {
+    CDN_CACHE.lock().ok()?.get(track_id, CACHE_TTL, now)
 }
 
 fn store_cdn_url(track_id: &str, url: String) {
+    store_cdn_url_at(track_id, url, std::time::Instant::now());
+}
+
+fn store_cdn_url_at(track_id: &str, url: String, now: std::time::Instant) {
     if let Ok(mut guard) = CDN_CACHE.lock() {
-        guard.sweep_expired(CACHE_TTL);
-        guard.insert(track_id.to_string(), url);
+        guard.sweep_expired(CACHE_TTL, now);
+        guard.insert(track_id.to_string(), url, now);
     }
 }
 
@@ -153,18 +205,26 @@ fn evict_cdn_url(track_id: &str) {
 /// died): the next attempt within [`NEG_TTL`] fails fast without hammering
 /// the upstreams.
 fn store_negative(track_id: &str) {
+    store_negative_at(track_id, std::time::Instant::now());
+}
+
+fn store_negative_at(track_id: &str, now: std::time::Instant) {
     if let Ok(mut guard) = NEG_CACHE.lock() {
-        guard.sweep_expired(NEG_TTL);
-        guard.insert(track_id.to_string(), String::new());
+        guard.sweep_expired(NEG_TTL, now);
+        guard.insert(track_id.to_string(), String::new(), now);
     }
 }
 
 /// `true` when the track failed recently (fail fast, see [`store_negative`]).
 fn is_negative(track_id: &str) -> bool {
+    is_negative_at(track_id, std::time::Instant::now())
+}
+
+fn is_negative_at(track_id: &str, now: std::time::Instant) -> bool {
     NEG_CACHE
         .lock()
         .ok()
-        .and_then(|mut guard| guard.get(track_id, NEG_TTL))
+        .and_then(|mut guard| guard.get(track_id, NEG_TTL, now))
         .is_some()
 }
 
@@ -703,11 +763,31 @@ mod tests {
     #[test]
     fn karaoke_cover_rejected() {
         let c = cand(
-            "Cut to the Feeling (Originally Performed by Carly Rae Jepsen) [Instrumental]",
-            &["Covered Up"],
+            "Cut To The Feeling (Karaoke Version)",
+            &["Carly Rae Jepsen"],
             206,
         );
         assert!(score_candidate(&meta(), &c) < ACCEPT_SCORE);
+    }
+
+    #[test]
+    fn title_and_artist_containment_rejected_when_either_side_mismatches() {
+        let title_contains_artist_mismatch =
+            cand("Prefix Cut To The Feeling Suffix", &["Someone Else"], 208);
+        assert_eq!(score_candidate(&meta(), &title_contains_artist_mismatch), 0);
+
+        let artist_contains_title_mismatch =
+            cand("Unrelated Song", &["Prefix Carly Rae Jepsen Suffix"], 208);
+        assert_eq!(score_candidate(&meta(), &artist_contains_title_mismatch), 0);
+    }
+
+    #[test]
+    fn exact_duration_boundary_is_accepted_and_one_second_over_is_rejected() {
+        let at_boundary = cand("Cut To The Feeling", &["Carly Rae Jepsen"], 222);
+        assert!(score_candidate(&meta(), &at_boundary) >= ACCEPT_SCORE);
+
+        let over_boundary = cand("Cut To The Feeling", &["Carly Rae Jepsen"], 223);
+        assert_eq!(score_candidate(&meta(), &over_boundary), 0);
     }
 
     #[test]
@@ -753,14 +833,21 @@ mod tests {
 
     #[test]
     fn cache_freshness() {
-        assert!(std::time::Instant::now().elapsed() < CACHE_TTL);
-        // Instant - Duration panics on underflow (fresh-boot machines), so a
-        // stale instant is only asserted when representable.
-        if let Some(stale) =
-            std::time::Instant::now().checked_sub(CACHE_TTL + std::time::Duration::from_secs(1))
-        {
-            assert!(stale.elapsed() >= CACHE_TTL);
-        }
+        let _cache_guard = lock_cache_for_test();
+        reset_caches_for_tests();
+        let base = std::time::Instant::now();
+        let id = "cache-freshness-track-xyz";
+        store_cdn_url_at(id, "https://cdn.example/song".to_string(), base);
+
+        assert_eq!(
+            cached_cdn_url_at(id, base),
+            Some("https://cdn.example/song".to_string())
+        );
+        assert_eq!(
+            cached_cdn_url_at(id, base + CACHE_TTL - std::time::Duration::from_nanos(1)),
+            Some("https://cdn.example/song".to_string())
+        );
+        assert!(cached_cdn_url_at(id, base + CACHE_TTL).is_none());
     }
 
     #[test]
@@ -791,35 +878,36 @@ mod tests {
             map: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
         };
+        let base = std::time::Instant::now();
         for i in 0..CACHE_CAP {
-            c.insert(format!("t{}", i), format!("u{}", i));
+            c.insert(format!("t{}", i), format!("u{}", i), base);
         }
-        // Touch t0 (now MRU), then overflow: t1 (LRU) goes, t0 survives.
-        assert_eq!(c.get("t0", CACHE_TTL).as_deref(), Some("u0"));
-        c.insert("new".to_string(), "unew".to_string());
+        assert_eq!(c.get("t0", CACHE_TTL, base).as_deref(), Some("u0"));
+        c.insert("new".to_string(), "unew".to_string(), base);
         assert_eq!(c.map.len(), CACHE_CAP);
-        assert!(c.get("t1", CACHE_TTL).is_none());
-        assert_eq!(c.get("t0", CACHE_TTL).as_deref(), Some("u0"));
-        assert_eq!(c.get("new", CACHE_TTL).as_deref(), Some("unew"));
-        // Expired entries read as misses and don't count as use.
-        c.map.insert(
-            "old".to_string(),
-            (
-                "uold".to_string(),
-                std::time::Instant::now() - CACHE_TTL * 2,
-            ),
-        );
-        assert!(c.get("old", CACHE_TTL).is_none());
+        assert!(c.get("t1", CACHE_TTL, base).is_none());
+        assert_eq!(c.get("t0", CACHE_TTL, base).as_deref(), Some("u0"));
+        assert_eq!(c.get("new", CACHE_TTL, base).as_deref(), Some("unew"));
+        c.insert("old".to_string(), "uold".to_string(), base);
+        let order_len = c.order.len();
+        assert!(c.get("old", CACHE_TTL, base + CACHE_TTL).is_none());
+        assert_eq!(c.order.len(), order_len - 1);
     }
 
     #[test]
     fn negative_cache_fails_fast_then_expires_by_ttl() {
+        let _cache_guard = lock_cache_for_test();
+        reset_caches_for_tests();
+        let base = std::time::Instant::now();
         let id = "neg-test-track-xyz";
-        assert!(!is_negative(id));
-        store_negative(id);
-        assert!(is_negative(id));
-        // A different id is unaffected (globals shared across tests).
-        assert!(!is_negative("neg-test-track-other"));
+        assert!(!is_negative_at(id, base));
+        store_negative_at(id, base);
+        assert!(is_negative_at(id, base));
+        assert!(is_negative_at(
+            id,
+            base + NEG_TTL - std::time::Duration::from_nanos(1)
+        ));
+        assert!(!is_negative_at(id, base + NEG_TTL));
     }
 
     use crate::mock::{MockServer, Route};
@@ -848,16 +936,8 @@ mod tests {
         br#"<html><head><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"title":"Test Song","artists":[{"name":"Test Artist"}],"duration":200000}}}}}}</script></head></html>"#.to_vec()
     }
 
-    /// Full flow against a canned upstream: embed → search → decrypt (no
-    /// details round-trip) → CDN stream, plain and ranged.
-    #[tokio::test]
-    async fn full_flow_resolves_and_streams_with_range() {
-        // Eager bind: the encrypted fixture embeds the port, so the socket
-        // must stay bound from pick to serve (no reserve-then-rebind race).
-        let (listener, port) = MockServer::bind_ephemeral().await;
-        let cdn_plain = format!("http://127.0.0.1:{}/cdn/song_96.mp4", port);
-        let enc = encrypt_media_url(&cdn_plain);
-        let search_json = serde_json::json!({
+    fn search_response(encrypted_url: String) -> serde_json::Value {
+        serde_json::json!({
             "total": 1,
             "results": [{
                 "id": "mock1",
@@ -866,18 +946,35 @@ mod tests {
                 "more_info": {
                     "duration": "200",
                     "320kbps": "true",
-                    "encrypted_media_url": enc,
+                    "encrypted_media_url": encrypted_url,
                     "artistMap": {"primary_artists": [{"name": "Test Artist"}]},
                 },
             }],
-        });
+        })
+    }
+
+    /// Full flow against a canned upstream: embed → search → decrypt (no
+    /// details round-trip) → CDN stream, plain and ranged.
+    #[tokio::test]
+    async fn full_flow_resolves_and_streams_with_range() {
+        let _cache_guard = lock_cache_for_test_async().await;
+        reset_caches_for_tests();
+        let (listener, port) = MockServer::bind_ephemeral().await;
+        let cdn_plain = format!("http://127.0.0.1:{}/cdn/song_96.mp4", port);
+        let search_json = search_response(encrypt_media_url(&cdn_plain));
         let mock = MockServer::serve(
             listener,
             vec![
-                Route::new("/embed/track/", vec![(200, embed_html())]),
+                Route::new(
+                    "/embed/track/",
+                    vec![(200, embed_html()), (500, b"embed called twice".to_vec())],
+                ),
                 Route::new(
                     "/api.php",
-                    vec![(200, serde_json::to_vec(&search_json).unwrap())],
+                    vec![
+                        (200, serde_json::to_vec(&search_json).unwrap()),
+                        (500, b"search called twice".to_vec()),
+                    ],
                 )
                 .containing("search.getResults"),
                 Route::new("/cdn/", vec![(200, MOCK_SONG.to_vec())]).ranged(),
@@ -903,6 +1000,64 @@ mod tests {
         let r = s.into_response();
         assert_eq!(r.status(), 206);
         assert_eq!(r.bytes().await.unwrap().as_ref(), &MOCK_SONG[..4]);
+    }
+
+    #[tokio::test]
+    async fn cached_cdn_403_is_evicted_and_re_resolved() {
+        let _cache_guard = lock_cache_for_test_async().await;
+        reset_caches_for_tests();
+        let (listener, port) = MockServer::bind_ephemeral().await;
+        let bad_cdn = format!("http://127.0.0.1:{}/cdn/bad_96.mp4", port);
+        let good_cdn = format!("http://127.0.0.1:{}/cdn/good_96.mp4", port);
+        let good_resolved = format!("http://127.0.0.1:{}/cdn/good_320.mp4", port);
+        let search_json = search_response(encrypt_media_url(&good_cdn));
+        let mock = MockServer::serve(
+            listener,
+            vec![
+                Route::new("/embed/track/", vec![(200, embed_html())]),
+                Route::new(
+                    "/api.php",
+                    vec![(200, serde_json::to_vec(&search_json).unwrap())],
+                )
+                .containing("search.getResults"),
+                Route::new("/cdn/bad_96.mp4", vec![(403, b"dead".to_vec())]),
+                Route::new("/cdn/good_320.mp4", vec![(200, MOCK_SONG.to_vec())]),
+            ],
+        );
+        let ep = SaavnEndpoints {
+            embed_base: mock.base_url.clone(),
+            api_base: mock.base_url.clone(),
+        };
+        let id = "cached-403-track-xyz";
+        store_cdn_url(id, bad_cdn);
+
+        let response = open_stream_with(&reqwest::Client::new(), id, None, None, &ep)
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), MOCK_SONG);
+        assert_eq!(cached_cdn_url(id).as_deref(), Some(good_resolved.as_str()));
+    }
+
+    #[tokio::test]
+    async fn negatively_cached_track_fails_without_network() {
+        let _cache_guard = lock_cache_for_test_async().await;
+        reset_caches_for_tests();
+        let id = "negative-open-track-xyz";
+        store_negative(id);
+        let mock =
+            MockServer::start(vec![Route::catch_all(500, b"network touched".to_vec())]).await;
+        let ep = SaavnEndpoints {
+            embed_base: mock.base_url.clone(),
+            api_base: mock.base_url.clone(),
+        };
+
+        let error = match open_stream_with(&reqwest::Client::new(), id, None, None, &ep).await {
+            Ok(_) => panic!("negative-cached track unexpectedly resolved"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("negative cache"));
     }
 
     /// `details` path with a live-captured vector: pointer parse + decrypt,
@@ -935,6 +1090,15 @@ mod tests {
     fn normalize_strips_case_and_punctuation() {
         assert_eq!(normalize("Cut To The Feeling!"), "cuttothefeeling");
         assert_eq!(normalize("8D Audio"), "8daudio");
+    }
+
+    #[test]
+    fn unicode_only_title_normalizes_to_empty_and_is_rejected() {
+        let mut m = meta();
+        m.title = "✨🎵".to_string();
+        let c = cand("✨🎵", &["Carly Rae Jepsen"], 208);
+        assert_eq!(normalize(&m.title), "");
+        assert_eq!(score_candidate(&m, &c), 0);
     }
 
     #[test]
