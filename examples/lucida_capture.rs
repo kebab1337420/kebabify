@@ -133,18 +133,15 @@ async fn wait_for_page(port: u16) -> Result<String> {
             .get(format!("http://127.0.0.1:{port}/json"))
             .send()
             .await
+            && let Ok(v) = r.json::<Value>().await
+            && let Some(pages) = v.as_array()
         {
-            if let Ok(v) = r.json::<Value>().await {
-                if let Some(pages) = v.as_array() {
-                    for p in pages {
-                        let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
-                        if ty == "page" {
-                            if let Some(ws) = p.get("webSocketDebuggerUrl").and_then(Value::as_str)
-                            {
-                                return Ok(ws.to_string());
-                            }
-                        }
-                    }
+            for p in pages {
+                let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
+                if ty == "page"
+                    && let Some(ws) = p.get("webSocketDebuggerUrl").and_then(Value::as_str)
+                {
+                    return Ok(ws.to_string());
                 }
             }
         }
@@ -167,16 +164,16 @@ async fn capture(cdp: &mut Cdp, secs: u64) -> Result<()> {
                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                         let method = v.get("method").and_then(Value::as_str).unwrap_or("");
                         if method == "Network.requestWillBeSent" {
-                            if let Some(params) = v.get("params") {
-                                if let Some(req) = params.get("request") {
-                                    let url = req.get("url").and_then(Value::as_str).unwrap_or("");
-                                    if url.contains("lucida") || url.contains("api") {
-                                        println!(
-                                            ">> REQ {} {}",
-                                            req.get("method").and_then(Value::as_str).unwrap_or(""),
-                                            url
-                                        );
-                                    }
+                            if let Some(params) = v.get("params")
+                                && let Some(req) = params.get("request")
+                            {
+                                let url = req.get("url").and_then(Value::as_str).unwrap_or("");
+                                if url.contains("lucida") || url.contains("api") {
+                                    println!(
+                                        ">> REQ {} {}",
+                                        req.get("method").and_then(Value::as_str).unwrap_or(""),
+                                        url
+                                    );
                                 }
                             }
                         } else if method == "Network.responseReceived" {
@@ -195,10 +192,10 @@ async fn capture(cdp: &mut Cdp, secs: u64) -> Result<()> {
                             }
                         } else if method == "Page.loadEventFired" {
                             println!("-- loadEventFired");
-                        } else if method == "Page.frameNavigated" {
-                            if let Some(p) = v.pointer("/params/frame/url") {
-                                println!("-- NAVIGATED {}", p.as_str().unwrap_or(""));
-                            }
+                        } else if method == "Page.frameNavigated"
+                            && let Some(p) = v.pointer("/params/frame/url")
+                        {
+                            println!("-- NAVIGATED {}", p.as_str().unwrap_or(""));
                         }
                     }
                 }

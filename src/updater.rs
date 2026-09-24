@@ -261,14 +261,14 @@ async fn download_to_part(
     resp = resp
         .error_for_status()
         .context("Update download returned an error")?;
-    if let Some(declared) = resp.content_length() {
-        if declared > MAX_UPDATE_BYTES {
-            return Err(anyhow!(
-                "Update asset declares {} bytes, above the {} byte cap",
-                declared,
-                MAX_UPDATE_BYTES
-            ));
-        }
+    if let Some(declared) = resp.content_length()
+        && declared > MAX_UPDATE_BYTES
+    {
+        return Err(anyhow!(
+            "Update asset declares {} bytes, above the {} byte cap",
+            declared,
+            MAX_UPDATE_BYTES
+        ));
     }
     let mut file =
         std::fs::File::create(part).with_context(|| format!("Cannot write {}", part.display()))?;
